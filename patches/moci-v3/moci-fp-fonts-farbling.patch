@@ -1,0 +1,105 @@
+diff --git a/third_party/blink/renderer/platform/fonts/skia/font_cache_skia.cc b/third_party/blink/renderer/platform/fonts/skia/font_cache_skia.cc
+index d74cb21e2c..de0431308b 100644
+--- a/third_party/blink/renderer/platform/fonts/skia/font_cache_skia.cc
++++ b/third_party/blink/renderer/platform/fonts/skia/font_cache_skia.cc
+@@ -34,10 +34,17 @@
+ #include <utility>
+ 
+ #include "base/check_op.h"
++#include "base/command_line.h"
+ #include "base/metrics/histogram_functions.h"
++#include "base/no_destructor.h"
+ #include "base/notreached.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/string_view_util.h"
++#include "base/synchronization/lock.h"
+ #include "build/build_config.h"
++#include <unordered_set>
++#include <string>
+ #include "skia/ext/font_utils.h"
+ #include "third_party/blink/public/platform/linux/web_sandbox_support.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -62,6 +69,68 @@
+ #error This file should not be used by MacOS.
+ #endif
+ 
++namespace {
++
++// [MoCi fp-fonts] 每 env chromium 进程独立字体白名单 (cross-env Fonts hash 独立)
++// 启动时从 --moci-fonts-list=Arial,Verdana,... switch 一次性 parse 进静态 set。
++// CreateTypeface() 拦截 family 不在 list 里时返 nullptr → 上游 CSS fallback 到 monospace
++// → offsetWidth 不变化 → JS 检测判定"字体不可用"→ Fonts hash 跨 env 独立。
++//
++// 行业方案（Brave Shields fonts farbling 同手法）：family 白名单 + 启动 switch 注入。
++// 无 switch 时 set 为空 → MoCiIsFontFarblingEnabled() 返 false → 所有字体 allow（向后兼容）。
++//
++// baseline 系统字体永远 allow，避免子集太诡异让网站怀疑（缺 Arial / Times New Roman 是异常信号）。
++
++const char kMoCiFontsListSwitch[] = "moci-fonts-list";
++
++const char* const kMoCiBaselineFonts[] = {
++  "Arial", "Helvetica", "Times New Roman", "Times",
++  "Verdana", "Tahoma", "Courier New", "Courier",
++  "monospace", "sans-serif", "serif", "cursive", "fantasy",
++};
++
++struct MoCiFarblingState {
++  bool enabled = false;
++  std::unordered_set<std::string> allowed_lowercase;
++};
++
++const MoCiFarblingState& MoCiGetFarblingState() {
++  static base::NoDestructor<MoCiFarblingState> state([]() {
++    MoCiFarblingState s;
++    const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++    if (!cmd || !cmd->HasSwitch(kMoCiFontsListSwitch)) {
++      return s;
++    }
++    std::string raw = cmd->GetSwitchValueASCII(kMoCiFontsListSwitch);
++    if (raw.empty()) {
++      return s;
++    }
++    s.enabled = true;
++    // baseline 永远 allow，先放进 set
++    for (const char* baseline : kMoCiBaselineFonts) {
++      s.allowed_lowercase.insert(base::ToLowerASCII(baseline));
++    }
++    // 逗号分隔 parse + lowercase 归一化
++    std::vector<std::string> families = base::SplitString(
++        raw, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    for (const std::string& family : families) {
++      s.allowed_lowercase.insert(base::ToLowerASCII(family));
++    }
++    return s;
++  }());
++  return *state;
++}
++
++bool MoCiIsFontAllowed(const std::string& family) {
++  const MoCiFarblingState& state = MoCiGetFarblingState();
++  if (!state.enabled) {
++    return true;  // 无 switch = farbling 关闭，所有字体 allow
++  }
++  return state.allowed_lowercase.count(base::ToLowerASCII(family)) > 0;
++}
++
++}  // namespace
++
+ namespace blink {
+ 
+ AtomicString ToAtomicString(const SkString& str) {
+@@ -291,6 +360,13 @@ sk_sp<SkTypeface> FontCache::CreateTypeface(
+       return typeface;
+   }
+ #endif  // BUILDFLAG(IS_ANDROID)
++
++  // [MoCi fp-fonts] family 不在 --moci-fonts-list 白名单时拦截：
++  // 返 nullptr 让 CreateFontPlatformData() 走 CSS fallback chain → monospace baseline
++  // → JS offsetWidth 与 monospace 相同 → 网页检测判定"该字体不可用"→ Fonts hash 跨 env 独立。
++  if (!name.empty() && !MoCiIsFontAllowed(name)) {
++    return nullptr;
++  }
+   return sk_sp<SkTypeface>(skia::DefaultFontMgr()->matchFamilyStyle(
+       name.empty() ? nullptr : name.c_str(), font_description.SkiaFontStyle()));
+ }

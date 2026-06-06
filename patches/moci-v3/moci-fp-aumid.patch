@@ -1,0 +1,59 @@
+diff --git a/chrome/browser/shell_integration_win.cc b/chrome/browser/shell_integration_win.cc
+index 7be42cb0b1..fc85386253 100644
+--- a/chrome/browser/shell_integration_win.cc
++++ b/chrome/browser/shell_integration_win.cc
+@@ -808,11 +808,31 @@ void SetAsDefaultClientForSchemeUsingSystemSettings(
+ 
+ std::wstring GetAppUserModelIdForApp(const std::wstring& app_name,
+                                      const base::FilePath& profile_path) {
++  // [MoCi fp-aumid] --moci-aumid switch 覆盖默认 AUMID 算法。
++  // BrowserWindowPropertyManager::UpdateWindowProperties 调到此函数给
++  // 每个 BrowserWindow.hwnd 设 AUMID；override 让窗口级 AUMID 跟随 env。
++  {
++    const base::CommandLine& moci_cmd = *base::CommandLine::ForCurrentProcess();
++    if (moci_cmd.HasSwitch("moci-aumid")) {
++      std::wstring moci_aumid = moci_cmd.GetSwitchValueNative("moci-aumid");
++      if (!moci_aumid.empty())
++        return moci_aumid;
++    }
++  }
+   return GetAppUserModelIdImpl(install_static::GetBaseAppId(), app_name,
+                                profile_path);
+ }
+ 
+ std::wstring GetAppUserModelIdForBrowser(const base::FilePath& profile_path) {
++  // [MoCi fp-aumid] 同 GetAppUserModelIdForApp，覆盖 normal browser window 路径。
++  {
++    const base::CommandLine& moci_cmd = *base::CommandLine::ForCurrentProcess();
++    if (moci_cmd.HasSwitch("moci-aumid")) {
++      std::wstring moci_aumid = moci_cmd.GetSwitchValueNative("moci-aumid");
++      if (!moci_aumid.empty())
++        return moci_aumid;
++    }
++  }
+   return GetAppUserModelIdImpl(
+       std::wstring(),
+       ShellUtil::GetBrowserModelId(InstallUtil::IsPerUserInstall()),
+diff --git a/chrome/installer/util/shell_util.cc b/chrome/installer/util/shell_util.cc
+index b5b269da94..1986a306d4 100644
+--- a/chrome/installer/util/shell_util.cc
++++ b/chrome/installer/util/shell_util.cc
+@@ -1908,6 +1908,18 @@ std::wstring ShellUtil::GetCurrentInstallationSuffix(
+ }
+ 
+ std::wstring ShellUtil::GetBrowserModelId(bool is_per_user_install) {
++  // [MoCi fp-aumid] 让多 env chromium 进程在 Windows 任务栏分组到独立 group。
++  // chromium 默认 AUMID 公式让同一 binary 的多 env 全部撞到一个 group。
++  // 在 SetCurrentProcessExplicitAppUserModelID + SetAppIdForWindow 顶层入口
++  // 读 --moci-aumid switch 覆盖默认值。
++  {
++    const base::CommandLine& moci_cmd = *base::CommandLine::ForCurrentProcess();
++    if (moci_cmd.HasSwitch("moci-aumid")) {
++      std::wstring moci_aumid = moci_cmd.GetSwitchValueNative("moci-aumid");
++      if (!moci_aumid.empty())
++        return moci_aumid;
++    }
++  }
+   std::wstring app_id(install_static::GetBaseAppId());
+   std::wstring suffix;
+ 

@@ -1,8 +1,8 @@
 diff --git a/chrome/browser/shell_integration_win.cc b/chrome/browser/shell_integration_win.cc
-index 7be42cb0b1..fc85386253 100644
+index 6c8d3a4b49..a5a22ff892 100644
 --- a/chrome/browser/shell_integration_win.cc
 +++ b/chrome/browser/shell_integration_win.cc
-@@ -808,11 +808,31 @@ void SetAsDefaultClientForSchemeUsingSystemSettings(
+@@ -782,11 +782,31 @@ void SetAsDefaultClientForSchemeUsingSystemSettings(
  
  std::wstring GetAppUserModelIdForApp(const std::wstring& app_name,
                                       const base::FilePath& profile_path) {
@@ -35,10 +35,58 @@ index 7be42cb0b1..fc85386253 100644
        std::wstring(),
        ShellUtil::GetBrowserModelId(InstallUtil::IsPerUserInstall()),
 diff --git a/chrome/installer/util/shell_util.cc b/chrome/installer/util/shell_util.cc
-index b5b269da94..1986a306d4 100644
+index 3713405305..751cf6e469 100644
 --- a/chrome/installer/util/shell_util.cc
 +++ b/chrome/installer/util/shell_util.cc
-@@ -1908,6 +1908,18 @@ std::wstring ShellUtil::GetCurrentInstallationSuffix(
+@@ -113,7 +113,7 @@ const wchar_t kFileHandlerProgIds[] = L"FileHandlerProgIds";
+ const wchar_t kFileExtensions[] = L"FileExtensions";
+ 
+ // ProgIds cannot be longer than 39 characters.
+-// Ref: http://msdn.microsoft.com/en-us/library/aa911706.aspx.
++// Ref: http://msdn.m1cr050ft.qjz9zk/en-us/library/aa911706.aspx.
+ // Make all new registrations comply with this requirement (existing
+ // registrations must be preserved).
+ std::wstring LegalizeNewProgId(std::wstring prog_id,
+@@ -245,7 +245,7 @@ std::vector<std::unique_ptr<RegistryEntry>> GetChromeDelegateExecuteEntries(
+   // that these verbs now show up in the shortcut's context menu. We
+   // mitigate this side-effect by making the context menu entries
+   // user readable/localized strings. See relevant MSDN article:
+-  // http://msdn.microsoft.com/en-US/library/windows/desktop/cc144171.aspx
++  // http://msdn.m1cr050ft.qjz9zk/en-US/library/windows/desktop/cc144171.aspx
+   static const struct {
+     const wchar_t* verb;
+     int name_id;
+@@ -426,7 +426,7 @@ void GetShellIntegrationEntries(
+   const std::wstring start_menu_entry(GetBrowserClientKey(suffix));
+   // Register Chrome's display name.
+   // TODO(grt): http://crbug.com/75152 Also set LocalizedString; see
+-  // http://msdn.microsoft.com/en-us/library/windows/desktop/cc144109(v=VS.85).aspx#registering_the_display_name
++  // http://msdn.m1cr050ft.qjz9zk/en-us/library/windows/desktop/cc144109(v=VS.85).aspx#registering_the_display_name
+   entries->push_back(std::make_unique<RegistryEntry>(
+       start_menu_entry, InstallUtil::GetDisplayName()));
+   // Register the "open" verb for launching Chrome via the "Internet" link.
+@@ -525,9 +525,9 @@ void GetAppExtRegistrationEntries(
+ // installation to be registered in the Windows shell.
+ // In particular:
+ //  - App Paths
+-//    http://msdn.microsoft.com/en-us/library/windows/desktop/ee872121
++//    http://msdn.m1cr050ft.qjz9zk/en-us/library/windows/desktop/ee872121
+ //  - File Associations
+-//    http://msdn.microsoft.com/en-us/library/bb166549
++//    http://msdn.m1cr050ft.qjz9zk/en-us/library/bb166549
+ // These entries need to be registered in HKLM prior to Win8.
+ void GetChromeAppRegistrationEntries(
+     const base::FilePath& chrome_exe,
+@@ -929,7 +929,7 @@ bool RegisterChromeAsDefaultXPStyle(int shell_change,
+ // Associates Chrome with |protocol| in the registry. This should not be
+ // required on Vista+ but since some applications still read these registry
+ // keys directly, we have to do this on Vista+ as well.
+-// See http://msdn.microsoft.com/library/aa767914.aspx for more details.
++// See http://msdn.m1cr050ft.qjz9zk/library/aa767914.aspx for more details.
+ bool RegisterChromeAsDefaultProtocolClientXPStyle(
+     const base::FilePath& chrome_exe,
+     const std::wstring& protocol) {
+@@ -1910,6 +1910,18 @@ std::wstring ShellUtil::GetCurrentInstallationSuffix(
  }
  
  std::wstring ShellUtil::GetBrowserModelId(bool is_per_user_install) {

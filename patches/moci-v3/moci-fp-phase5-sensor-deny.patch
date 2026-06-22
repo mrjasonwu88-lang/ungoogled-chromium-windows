@@ -1,0 +1,21 @@
+diff --git a/services/device/generic_sensor/sensor_provider_impl.cc b/services/device/generic_sensor/sensor_provider_impl.cc
+index e1087eab0b..c5861cedb1 100644
+--- a/services/device/generic_sensor/sensor_provider_impl.cc
++++ b/services/device/generic_sensor/sensor_provider_impl.cc
+@@ -82,6 +82,16 @@ void SensorProviderImpl::OnReceiverDisconnected() {
+ 
+ void SensorProviderImpl::GetSensor(mojom::SensorType type,
+                                    GetSensorCallback callback) {
++  // [MoCi v.218 Phase 5 #7] 桌面端全 sensor deny
++  // Stanford 2016 论文：motion sensor calibration 42-bit 熵跨 env 关联
++  // chromium 默认 kGenericSensorExtraClasses=DISABLED 已关 Accelerometer/Gyroscope/Magnetometer/Orientation
++  // 但 AmbientLight 不在 extra list；为防御性兜底（避免上游版本升级行为变化），一刀切全 deny
++  // 桌面 Chrome 真实行为本来就无 sensor 数据（多数桌面无硬件），deny 跟真实桌面一致最 stealth
++  // 业务影响零（亚马逊 / Walmart / 普通业务站不用 Sensor API）
++  std::move(callback).Run(mojom::SensorCreationResult::ERROR_NOT_AVAILABLE,
++                          nullptr);
++  return;
++
+   if (!base::FeatureList::IsEnabled(features::kGenericSensorExtraClasses) &&
+       IsExtraSensorClass(type)) {
+     std::move(callback).Run(mojom::SensorCreationResult::ERROR_NOT_AVAILABLE,

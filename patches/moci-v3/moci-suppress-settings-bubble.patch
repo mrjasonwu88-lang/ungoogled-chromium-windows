@@ -1,0 +1,68 @@
+diff --git a/chrome/browser/ui/extensions/settings_api_bubble_helpers.cc b/chrome/browser/ui/extensions/settings_api_bubble_helpers.cc
+index cc4840dd31..7ce5fdf6fc 100644
+--- a/chrome/browser/ui/extensions/settings_api_bubble_helpers.cc
++++ b/chrome/browser/ui/extensions/settings_api_bubble_helpers.cc
+@@ -8,6 +8,7 @@
+ #include <utility>
+ 
+ #include "base/auto_reset.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/ptr_util.h"
+ #include "build/build_config.h"
+@@ -17,6 +18,7 @@
+ #include "chrome/browser/ui/extensions/extension_settings_overridden_dialog.h"
+ #include "chrome/browser/ui/extensions/extensions_dialogs.h"
+ #include "chrome/browser/ui/extensions/settings_overridden_params_providers.h"
++#include "chrome/common/chrome_switches.h"
+ #include "chrome/common/url_constants.h"
+ #include "components/prefs/pref_registry.h"
+ #include "components/prefs/pref_registry_simple.h"
+@@ -33,6 +35,17 @@ namespace extensions {
+ 
+ namespace {
+ 
++// [MoCi suppress-settings-bubble] MoCi env 内置 "魔词工作台" 扩展通过
++// chrome_url_overrides.newtab 接管新标签页 → 触发 chromium 反劫持的
++// "您要变更此页面吗" bubble。用户在 MoCi 内嵌环境里这个 bubble 无意义
++// （扩展是 MoCi 自家产品，不是恶意劫持），全部静默抑制。
++// 用 --moci-locked-extensions 命令行 switch 存在与否做开关 — 跟
++// moci-ext-protect.patch 同款触发条件。
++bool IsMoCiManagedSession() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      ::switches::kMoCiLockedExtensions);
++}
++
+ // Whether the NTP post-install UI is enabled. By default, this is limited to
+ // Windows, Mac, ChromeOS, and Desktop Android but can be overridden for
+ // testing.
+@@ -108,6 +121,9 @@ void RegisterSettingsOverriddenUiPrefs(PrefRegistrySimple* registry) {
+ void MaybeShowExtensionControlledHomeNotification(
+     BrowserWindowInterface* browser,
+     content::WebContents* web_contents) {
++  if (IsMoCiManagedSession()) {
++    return;
++  }
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
+   auto* profile = browser->GetProfile();
+   auto bubble_delegate =
+@@ -125,6 +141,9 @@ void MaybeShowExtensionControlledHomeNotification(
+ void MaybeShowExtensionControlledSearchNotification(
+     content::WebContents* web_contents,
+     AutocompleteMatch::Type match_type) {
++  if (IsMoCiManagedSession()) {
++    return;
++  }
+ #if BUILDFLAG(IS_WIN) || BUILDFLAG(IS_MAC)
+   if (!AutocompleteMatch::IsSearchType(match_type) ||
+       match_type == AutocompleteMatchType::SEARCH_OTHER_ENGINE) {
+@@ -164,6 +183,9 @@ void MaybeShowExtensionControlledSearchNotification(
+ void MaybeShowExtensionControlledNewTabPage(
+     BrowserWindowInterface* browser,
+     content::WebContents* web_contents) {
++  if (IsMoCiManagedSession()) {
++    return;
++  }
+   if (!g_ntp_post_install_ui_enabled) {
+     return;
+   }

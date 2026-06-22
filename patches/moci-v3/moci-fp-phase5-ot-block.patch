@@ -1,0 +1,20 @@
+diff --git a/third_party/blink/renderer/core/origin_trials/origin_trial_context.cc b/third_party/blink/renderer/core/origin_trials/origin_trial_context.cc
+index dace1a3fb4..eae8e200ec 100644
+--- a/third_party/blink/renderer/core/origin_trials/origin_trial_context.cc
++++ b/third_party/blink/renderer/core/origin_trials/origin_trial_context.cc
+@@ -197,6 +197,15 @@ std::unique_ptr<Vector<String>> OriginTrialContext::ParseHeaderValue(
+ // static
+ void OriginTrialContext::AddTokensFromHeader(ExecutionContext* context,
+                                              const String& header_value) {
++  // [MoCi v.217 Phase 5 #6] OT token 跨 env 关联防御
++  // header_value 含 RSA-signed token 是 high-entropy ID；多 env 接收同 token 让 browser
++  // 端持久化的 signature 跨 env 一致 → 风控通过 signature 关联两 env。
++  // 直接拒所有从 HTTP header 来的 OT token；<meta name="origin-trial"> 内嵌仍可用
++  // （那是 server-side 主动选择 embed 的，可控）。
++  // 拦截影响面：仅 Fledge/TopicsAPI/FencedFrames 等隐私沙箱实验 features，对亚马逊
++  // 卖家后台 / Walmart / 一般电商业务零影响。
++  return;
++
+   if (header_value.empty())
+     return;
+   std::unique_ptr<Vector<String>> tokens(ParseHeaderValue(header_value));

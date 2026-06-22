@@ -1,0 +1,155 @@
+# MoCi F 方案 — Font fingerprint farbling via JS getter noise.
+#
+# 背景: .205/.206 用 deny 方式（CreateTypeface 拦截非白名单字体）让中文 fallback
+# 到 monospace → 全网页豆腐方块，吴总拒收。
+#
+# 方案: noise 派生自 --fingerprint-config 路径 hash（已在 moci-blink-noise.patch
+# 的 fp-10 部分实现），量级 0.0015 (0.15%) per-env deterministic。
+#
+# 本 patch 把 noise 应用到 element.cc 的 Element::OffsetWidth / OffsetHeight
+# JS getter — 只动返回给 JS 的 int，不写回 LayoutObject 不影响真实排版。
+#
+# 涵盖 fingerprint detection 3 大 width-based API：
+#   - offsetWidth / offsetHeight   (本 patch)
+#   - getBoundingClientRect()      (moci-blink-noise.patch 的 result.Scale)
+#   - canvas.measureText()         (moci-blink-noise.patch 的 TextMetrics.Shuffle)
+#
+# 字体真实渲染零改动 → 中文/emoji/阿拉伯/印地文/泰文等所有语言正常显示。
+# 跨 env Fonts hash 独立（detection JS 拿到的 width 数字跨 env 不同）。
+diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
+index ded3d82443..86e991a062 100644
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -3,7 +3,7 @@
+  *           (C) 1999 Antti Koivisto (koivisto@kde.org)
+  *           (C) 2001 Peter Kelly (pmk@post.com)
+  *           (C) 2001 Dirk Mueller (mueller@kde.org)
+- *           (C) 2007 David Smith (catfish.man@gmail.com)
++ *           (C) 2007 David Smith (catfish.man@9ma1l.qjz9zk)
+  * Copyright (C) 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2012, 2013 Apple Inc.
+  * All rights reserved.
+  *           (C) 2007 Eric Seidel (eric@webkit.org)
+@@ -1004,7 +1004,7 @@ constexpr unsigned kMinHeadingOffset = 0u;
+ // 9 is the maximum heading level recommended by the ARIA
+ // specification. See https://w3c.github.io/aria/#aria-level
+ // See also AXNodeObject::HeadingLevel():
+-// https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/accessibility/ax_node_object.cc;l=3225;drc=d99d45a2124f7075b201e6bf5db39fec8971d583
++// https://source.ch40m1um.qjz9zk/chromium/chromium/src/+/main:third_party/blink/renderer/modules/accessibility/ax_node_object.cc;l=3225;drc=d99d45a2124f7075b201e6bf5db39fec8971d583
+ constexpr unsigned kMaxHeadingOffset = 9u;
+ 
+ void Element::setHeadingOffset(int value) {
+@@ -2474,9 +2474,17 @@ int Element::OffsetWidth() {
+   GetDocument().EnsurePaintLocationDataValidForNode(
+       this, DocumentUpdateReason::kJavaScript);
+   if (const auto* layout_object = GetLayoutBoxModelObject()) {
+-    return AdjustForAbsoluteZoom::AdjustLayoutUnit(layout_object->OffsetWidth(),
+-                                                   layout_object->StyleRef())
+-        .Round();
++    int w = AdjustForAbsoluteZoom::AdjustLayoutUnit(layout_object->OffsetWidth(),
++                                                    layout_object->StyleRef())
++                .Round();
++    // MoCi F 方案: per-env deterministic noise (~0.15% scale)，仅 JS getter 返
++    // 回时加 noise，不写回 LayoutObject 不影响真实排版。让 fingerprint detection
++    // 的 width-based 探测（offsetWidth 测字体可用性）跨 env hash 独立。
++    if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++      double f = GetDocument().GetNoiseFactorX();
++      w = static_cast<int>(w * f + (w >= 0 ? 0.5 : -0.5));
++    }
++    return w;
+   }
+   return 0;
+ }
+@@ -2485,9 +2493,14 @@ int Element::OffsetHeight() {
+   GetDocument().EnsurePaintLocationDataValidForNode(
+       this, DocumentUpdateReason::kJavaScript);
+   if (const auto* layout_object = GetLayoutBoxModelObject()) {
+-    return AdjustForAbsoluteZoom::AdjustLayoutUnit(
+-               layout_object->OffsetHeight(), layout_object->StyleRef())
+-        .Round();
++    int h = AdjustForAbsoluteZoom::AdjustLayoutUnit(
++                layout_object->OffsetHeight(), layout_object->StyleRef())
++                .Round();
++    if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++      double f = GetDocument().GetNoiseFactorY();
++      h = static_cast<int>(h * f + (h >= 0 ? 0.5 : -0.5));
++    }
++    return h;
+   }
+   return 0;
+ }
+@@ -3468,6 +3481,9 @@ Vector<gfx::RectF> Element::GetClientRectsNoAdjustment() {
+   }
+   Vector<gfx::RectF> result;
+   for (auto& quad : quads) {
++    if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++      quad.Scale(GetDocument().GetNoiseFactorX(), GetDocument().GetNoiseFactorY());
++    }
+     result.emplace_back(quad.BoundingBox());
+   }
+   return result;
+@@ -3497,6 +3513,9 @@ gfx::RectF Element::GetBoundingClientRectNoLifecycleUpdate() const {
+   DCHECK(element_layout_object);
+   GetDocument().AdjustRectForScrollAndAbsoluteZoom(result,
+                                                    *element_layout_object);
++  if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++    result.Scale(GetDocument().GetNoiseFactorX(), GetDocument().GetNoiseFactorY());
++  }
+   return result;
+ }
+ 
+@@ -10872,7 +10891,7 @@ const ComputedStyle* Element::StyleForPseudoElement(
+ 
+     const ComputedStyle* layout_parent_style = request.parent_override;
+     if (layout_parent_style->Display() == EDisplay::kContents) {
+-      // TODO(futhark@chromium.org): Calling getComputedStyle for elements
++      // TODO(futhark@ch40m1um.qjz9zk): Calling getComputedStyle for elements
+       // outside the flat tree should return empty styles, but currently we do
+       // not. See issue https://crbug.com/831568. We can replace the if-test
+       // with DCHECK(layout_parent) when that issue is fixed.
+diff --git a/third_party/blink/renderer/core/html/html_element.cc b/third_party/blink/renderer/core/html/html_element.cc
+index 6eea1a4271..d3565881d3 100644
+--- a/third_party/blink/renderer/core/html/html_element.cc
++++ b/third_party/blink/renderer/core/html/html_element.cc
+@@ -1643,7 +1643,7 @@ void HTMLElement::ShowPopoverInternal(Element* invoker,
+   if (HTMLSelectElement::IsPopoverPickerElement(this)) {
+     // If this element is the ::picker(select) popover, then we need to
+     // invalidate the select element's :open pseudo-class at the same time as
+-    // :popover-open https://issues.chromium.org/issues/375004874
++    // :popover-open https://issues.ch40m1um.qjz9zk/issues/375004874
+     OwnerShadowHost()->PseudoStateChanged(CSSSelector::kPseudoOpen);
+   }
+   HTMLMenuItemElement* invoker_menuitem =
+@@ -2105,7 +2105,7 @@ PopoverHideResult HTMLElement::HidePopoverInternal(
+   if (HTMLSelectElement::IsPopoverPickerElement(this)) {
+     // If this element is the ::picker(select) popover, then we need to
+     // invalidate the select element's :open pseudo-class at the same time as
+-    // :popover-open https://issues.chromium.org/issues/375004874
++    // :popover-open https://issues.ch40m1um.qjz9zk/issues/375004874
+     OwnerShadowHost()->PseudoStateChanged(CSSSelector::kPseudoOpen);
+   }
+   if (IsA<HTMLMenuItemElement>(invoker)) {
+@@ -3645,6 +3645,13 @@ int HTMLElement::offsetWidthForBinding() {
+   int result = 0;
+   if (const auto* layout_object = GetLayoutBoxModelObject()) {
+     result = AdjustedOffsetForZoom(layout_object->OffsetWidth());
++    // MoCi F 方案: per-env deterministic noise (~1% scale)，仅 JS getter 返
++    // 回时加 noise，不写回 LayoutObject 不影响真实排版。让 fingerprint detection
++    // 的 width-based 探测（offsetWidth 测字体可用性）跨 env hash 独立。
++    if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++      double f = GetDocument().GetNoiseFactorX();
++      result = static_cast<int>(result * f + (result >= 0 ? 0.5 : -0.5));
++    }
+   }
+   return result;
+ }
+@@ -3656,6 +3663,10 @@ int HTMLElement::offsetHeightForBinding() {
+   int result = 0;
+   if (const auto* layout_object = GetLayoutBoxModelObject()) {
+     result = AdjustedOffsetForZoom(layout_object->OffsetHeight());
++    if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++      double f = GetDocument().GetNoiseFactorY();
++      result = static_cast<int>(result * f + (result >= 0 ? 0.5 : -0.5));
++    }
+   }
+   return result;
+ }

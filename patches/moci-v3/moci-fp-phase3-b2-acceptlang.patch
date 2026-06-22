@@ -1,0 +1,69 @@
+[MoCi Phase 3-B B-2] Accept-Language + navigator.language 联动 spoofing
+
+涉及 2 文件：
+  - net/url_request/url_request_http_job.cc — HTTP Accept-Language header 替换
+  - third_party/blink/renderer/core/frame/navigator_language.cc — navigator.languages 替换
+
+两个入口共用 moci::ShouldOverrideAcceptLanguage / GetSpoofedAcceptLanguage，
+让请求 header 跟 JS 暴露层 100% 一致。
+
+diff --git a/net/url_request/url_request_http_job.cc b/net/url_request/url_request_http_job.cc
+index 86a601592c..7fc26b34f8 100644
+--- a/net/url_request/url_request_http_job.cc
++++ b/net/url_request/url_request_http_job.cc
+@@ -15,6 +15,7 @@
+ #include "base/base_switches.h"
+ #include "base/check_op.h"
+ #include "base/command_line.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "base/compiler_specific.h"
+ #include "base/feature_list.h"
+ #include "base/file_version_info.h"
+@@ -806,6 +807,17 @@ void URLRequestHttpJob::AddExtraHeaders() {
+       request()->context()->enable_brotli(),
+       request()->context()->enable_zstd());
+ 
++  // === MoCi Browser: Accept-Language Spoofing (Phase 3-B B-2) ===
++  // 按 proxy.country 派生的 Accept-Language 优先（kernel-manager.ts 派生）
++  // 跟 navigator.language / Intl.locale 同源，CreepJS 联动一致性必须
++  if (moci::ShouldOverrideAcceptLanguage()) {
++    request_info_.extra_headers.SetHeaderIfMissing(
++        HttpRequestHeaders::kAcceptLanguage,
++        moci::GetSpoofedAcceptLanguage());
++    return;
++  }
++  // === End MoCi Browser Modification ===
++
+   if (http_user_agent_settings_) {
+     // Only add default Accept-Language if the request didn't have it
+     // specified.
+diff --git a/third_party/blink/renderer/core/frame/navigator_language.cc b/third_party/blink/renderer/core/frame/navigator_language.cc
+index 75cd346131..2567cb794c 100644
+--- a/third_party/blink/renderer/core/frame/navigator_language.cc
++++ b/third_party/blink/renderer/core/frame/navigator_language.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/core/frame/navigator_language.h"
+ 
+ #include "base/command_line.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "services/network/public/cpp/features.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+@@ -69,6 +70,17 @@ void NavigatorLanguage::SetLanguagesForTesting(const String& languages) {
+ }
+ 
+ void NavigatorLanguage::EnsureUpdatedLanguage() {
++  // === MoCi Browser: navigator.language Spoofing (Phase 3-B B-2 配套) ===
++  // 用 fp-config 里 acceptLanguage 派生 navigator.language/languages
++  // 跟 Accept-Language HTTP header (url_request_http_job.cc) 同源
++  // 不只重写 Accept-Language wire，JS API navigator.language/languages 也跟着变
++  if (moci::ShouldOverrideAcceptLanguage()) {
++    languages_ = ParseAndSanitize(String::FromUtf8(moci::GetSpoofedAcceptLanguage()));
++    languages_dirty_ = false;
++    return;
++  }
++  // === End MoCi Browser Modification ===
++
+   String accept_languages_override;
+   probe::ApplyAcceptLanguageOverride(execution_context_,
+                                      &accept_languages_override);

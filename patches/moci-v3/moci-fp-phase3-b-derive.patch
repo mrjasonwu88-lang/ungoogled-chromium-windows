@@ -1,0 +1,148 @@
+[MoCi Phase 3-B B-3..B-6] 单点字段 spoofing 集合
+
+涉及 4 文件 — 每个文件一个独立 B-X 指纹防护点：
+  - third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc — A-2 decodingInfo 按 mime 派生 powerEfficient/smooth
+  - third_party/blink/renderer/modules/device_orientation/device_motion_controller.cc — B-4 DeviceMotion sensor 开关
+  - third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc — B-5 WebAuthn platform authenticator 可用性
+  - third_party/blink/renderer/core/timing/memory_info.cc — B-6 performance.memory 上限按 env 派生
+
+每个均读 MoCiFingerprintConfig 的 JSON 字段，跨 env 隔离。
+
+diff --git a/third_party/blink/renderer/core/timing/memory_info.cc b/third_party/blink/renderer/core/timing/memory_info.cc
+index b17ada56e6..1497e6feb2 100644
+--- a/third_party/blink/renderer/core/timing/memory_info.cc
++++ b/third_party/blink/renderer/core/timing/memory_info.cc
+@@ -34,6 +34,7 @@
+ 
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/wtf/math_extras.h"
+@@ -51,7 +52,16 @@ static void GetHeapSize(HeapInfo& info) {
+       heap_statistics.used_heap_size() + heap_statistics.external_memory();
+   info.total_js_heap_size =
+       heap_statistics.total_physical_size() + heap_statistics.external_memory();
+-  info.js_heap_size_limit = heap_statistics.heap_size_limit();
++  // === MoCi Browser: Performance.memory Spoofing (Phase 3-B B-6) ===
++  // jsHeapSizeLimit 按 fingerprint.deviceMemory 派生（4GB → 2GB heap / 8GB+ → 4GB heap）
++  // 跟 navigator.deviceMemory 联动，CON-15 三联一致性必须
++  uint64_t spoofed = moci::GetSpoofedPerformanceMemoryLimit();
++  if (spoofed > 0) {
++    info.js_heap_size_limit = spoofed;
++  } else {
++    info.js_heap_size_limit = heap_statistics.heap_size_limit();
++  }
++  // === End MoCi Browser Modification ===
+ }
+ 
+ class HeapSizeCache {
+diff --git a/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc b/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc
+index 1be4ea3785..86f5391d6e 100644
+--- a/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc
++++ b/third_party/blink/renderer/modules/credentialmanagement/public_key_credential.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ #include <variant>
+ 
++#include "components/moci/fingerprint_helpers.h"
+ #include "third_party/abseil-cpp/absl/functional/overload.h"
+ #include "third_party/blink/public/mojom/webauthn/authenticator.mojom-shared.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+@@ -185,6 +186,13 @@ PublicKeyCredential::isUserVerifyingPlatformAuthenticatorAvailable(
+       WebFeature::
+           kCredentialManagerIsUserVerifyingPlatformAuthenticatorAvailable);
+ 
++  // === MoCi Browser: WebAuthn Spoofing (Phase 3-B B-5) ===
++  // 跟 fingerprint.os 联动派生：Linux false / Win/Mac true
++  // 风险：Win11 false 被 Microsoft/Google 登录页判异常
++  resolver->Resolve(moci::IsWebAuthnPlatformAuthenticatorAvailable());
++  return promise;
++  // === End MoCi Browser Modification ===
++
+   auto* authenticator =
+       CredentialManagerProxy::From(script_state)->Authenticator();
+   authenticator->IsUserVerifyingPlatformAuthenticatorAvailable(
+diff --git a/third_party/blink/renderer/modules/device_orientation/device_motion_controller.cc b/third_party/blink/renderer/modules/device_orientation/device_motion_controller.cc
+index b16806e27b..4f911734c4 100644
+--- a/third_party/blink/renderer/modules/device_orientation/device_motion_controller.cc
++++ b/third_party/blink/renderer/modules/device_orientation/device_motion_controller.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/device_orientation/device_motion_controller.h"
+ 
++#include "components/moci/fingerprint_helpers.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -48,6 +49,14 @@ void DeviceMotionController::DidAddEventListener(
+   if (event_type != EventTypeName())
+     return;
+ 
++  // === MoCi Browser: Sensor Spoofing (Phase 3-B B-4) ===
++  // 桌面 OS UA 不应有 DeviceMotion sensor，按 fp config "sensors.deviceMotionEnabled"
++  // 默认 false 让 addEventListener 静默忽略（不触发 sensor 启动 + 不订阅 mojo）
++  if (!moci::IsSensorDeviceMotionEnabled()) {
++    return;
++  }
++  // === End MoCi Browser Modification ===
++
+   // The window could be detached, e.g. if it is the `contentWindow` of an
+   // <iframe> that has been removed from the DOM of its parent frame.
+   if (GetWindow().IsContextDestroyed())
+diff --git a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+index 583d08846d..45d2b7f826 100644
+--- a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
++++ b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include "base/feature_list.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/safe_conversions.h"
+@@ -805,6 +806,33 @@ ScriptPromise<MediaCapabilitiesDecodingInfo> MediaCapabilities::decodingInfo(
+   // Validation errors should return above.
+   DCHECK(message.empty());
+ 
++  // === MoCi Browser: MediaCapabilities Spoofing (Phase 3-A A-2) ===
++  // 跟 WebGL renderer 一致性最强相关 — 伪装 GPU 不同步改这里 → 单点穿帮
++  // 按 video.contentType / audio.contentType 查 fp config "media.capabilities" 矩阵
++  // 没匹配 mime 时返默认 {smooth=false, powerEfficient=false, supported=true}
++  if (!is_webrtc && moci::ShouldOverrideMediaCapabilities()) {
++    String mime;
++    if (config->hasVideo() && config->video()) {
++      mime = config->video()->contentType();
++    } else if (config->hasAudio() && config->audio()) {
++      mime = config->audio()->contentType();
++    }
++    if (!mime.empty()) {
++      auto cap = moci::GetMediaCapability(mime.Utf8().c_str());
++      auto* resolver = MakeGarbageCollected<
++          ScriptPromiseResolver<MediaCapabilitiesDecodingInfo>>(
++          script_state, exception_state.GetContext());
++      auto promise = resolver->Promise();
++      auto* info = MediaCapabilitiesDecodingInfo::Create();
++      info->setSupported(cap.supported);
++      info->setSmooth(cap.smooth);
++      info->setPowerEfficient(cap.power_efficient);
++      resolver->Resolve(info);
++      return promise;
++    }
++  }
++  // === End MoCi Browser Modification ===
++
+   if (is_webrtc) {
+     UseCounter::Count(ExecutionContext::From(script_state),
+                       WebFeature::kMediaCapabilitiesDecodingInfoWebrtc);
+@@ -1183,7 +1211,7 @@ ScriptPromise<MediaCapabilitiesDecodingInfo> MediaCapabilities::GetEmeSupport(
+   DCHECK(execution_context);
+ 
+   // See context here:
+-  // https://sites.google.com/a/chromium.org/dev/Home/chromium-security/deprecating-permissions-in-cross-origin-iframes
++  // https://sites.9oo91e.qjz9zk/a/ch40m1um.qjz9zk/dev/Home/chromium-security/deprecating-permissions-in-cross-origin-iframes
+   if (!execution_context->IsFeatureEnabled(
+           network::mojom::PermissionsPolicyFeature::kEncryptedMedia,
+           ReportOptions::kReportOnFailure)) {

@@ -1,0 +1,213 @@
+diff --git a/chrome/browser/extensions/chrome_extension_system.cc b/chrome/browser/extensions/chrome_extension_system.cc
+index 3235aa4a90..75dfdfb145 100644
+--- a/chrome/browser/extensions/chrome_extension_system.cc
++++ b/chrome/browser/extensions/chrome_extension_system.cc
+@@ -12,6 +12,8 @@
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/string_tokenizer.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+@@ -22,6 +24,7 @@
+ #include "chrome/browser/extensions/chrome_content_verifier_delegate.h"
+ #include "chrome/browser/extensions/chrome_extension_system_factory.h"
+ #include "chrome/browser/extensions/component_loader.h"
++#include "chrome/browser/extensions/extension_allowlist.h"
+ #include "chrome/browser/extensions/extension_error_controller.h"
+ #include "chrome/browser/extensions/extension_garbage_collector.h"
+ #include "chrome/browser/extensions/extension_management.h"
+@@ -50,6 +53,7 @@
+ #include "extensions/browser/extension_pref_value_map.h"
+ #include "extensions/browser/extension_pref_value_map_factory.h"
+ #include "extensions/browser/extension_prefs.h"
++#include "extensions/browser/management_policy.h"
+ #include "extensions/browser/extension_registry.h"
+ #include "extensions/browser/extension_util.h"
+ #include "extensions/browser/install_verifier.h"
+@@ -109,6 +113,53 @@ UninstallPingSender::FilterResult ShouldSendUninstallPing(
+   return UninstallPingSender::DO_NOT_SEND_PING;
+ }
+ 
++// [MoCi ext-protect] Parse --moci-locked-extensions=<id1>,<id2> at startup,
++// then implement ManagementPolicy::Provider so chromium treats those
++// extensions as if installed by enterprise policy:
++//   - UserMayModifySettings = false (Remove/Disable hidden in chrome://extensions)
++//   - MustRemainEnabled = true (Disable toggle grayed out)
++//   - MustRemainInstalled = true (uninstall API call fails)
++class MoCiLockedExtensionProvider : public ManagementPolicy::Provider {
++ public:
++  MoCiLockedExtensionProvider() {
++    auto* cmd = base::CommandLine::ForCurrentProcess();
++    if (!cmd->HasSwitch(::switches::kMoCiLockedExtensions)) {
++      return;
++    }
++    std::string val =
++        cmd->GetSwitchValueASCII(::switches::kMoCiLockedExtensions);
++    for (const auto& id : base::SplitString(
++             val, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++      locked_ids_.insert(id);
++    }
++  }
++  ~MoCiLockedExtensionProvider() override = default;
++
++  std::string GetDebugPolicyProviderName() const override {
++    return "MoCi LockedExtension";
++  }
++  bool UserMayModifySettings(const Extension* extension,
++                             std::u16string* error) const override {
++    return !locked_ids_.contains(extension->id());
++  }
++  // NB: 不实现 MustRemainEnabled — chromium 内部 Reload 走
++  // DisableExtension(REASON_RELOAD) + EnableExtension。强制 enable 会让 Reload
++  // 拒，UI 状态错乱让 extension 看似消失。改设置/disable toggle 仍被
++  // UserMayModifySettings=false 拦住。
++  bool MustRemainInstalled(const Extension* extension,
++                           std::u16string* error) const override {
++    return locked_ids_.contains(extension->id());
++  }
++
++ private:
++  std::set<std::string> locked_ids_;
++};
++
++ManagementPolicy::Provider* GetMoCiLockedExtensionProvider() {
++  static base::NoDestructor<MoCiLockedExtensionProvider> provider;
++  return provider.get();
++}
++
+ }  // namespace
+ 
+ //
+@@ -187,6 +238,9 @@ void ChromeExtensionSystem::Shared::RegisterManagementPolicyProviders() {
+         policy::features::kEnableExtensionInstallPolicyFetching));
+     management_policy_->RegisterProvider(extension_install_policy_service);
+   }
++
++  // [MoCi ext-protect] Lock down bundled 魔词工作台 (and friends).
++  management_policy_->RegisterProvider(GetMoCiLockedExtensionProvider());
+ }
+ 
+ void ChromeExtensionSystem::Shared::InitInstallGates() {
+@@ -474,8 +528,8 @@ void ChromeExtensionSystem::InstallUpdate(
+ void ChromeExtensionSystem::PerformActionBasedOnOmahaAttributes(
+     const std::string& extension_id,
+     const base::DictValue& attributes) {
+-  extension_service()->PerformActionBasedOnOmahaAttributes(extension_id,
+-                                                           attributes);
++  extension_service()->allowlist()->PerformActionBasedOnOmahaAttributes(
++      extension_id, attributes);
+ }
+ 
+ }  // namespace extensions
+diff --git a/chrome/browser/extensions/extension_management.cc b/chrome/browser/extensions/extension_management.cc
+index bea1864156..a027392a4f 100644
+--- a/chrome/browser/extensions/extension_management.cc
++++ b/chrome/browser/extensions/extension_management.cc
+@@ -184,7 +184,7 @@ bool ExtensionManagement::ExtensionsEnabledForDesktopAndroid() const {
+   // Crude check to avoid passing invalid strings to `ExtractDomainName`.
+   if (user_name.contains("@")) {
+     std::string domain = gaia::ExtractDomainName(user_name);
+-    if (domain == "google.com" || domain == "managedchrome.com") {
++    if (domain == "9oo91e.qjz9zk" || domain == "managedch40me.qjz9zk") {
+       return base::FeatureList::IsEnabled(
+               extensions_features::kEnableExtensionsForCorpDesktopAndroid);
+     }
+@@ -331,6 +331,13 @@ bool ExtensionManagement::IsInstallationExplicitlyBlocked(
+ bool ExtensionManagement::IsOffstoreInstallAllowed(
+     const GURL& url,
+     const GURL& referrer_url) const {
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  if (command_line.HasSwitch("extension-mime-request-handling") &&
++      command_line.GetSwitchValueASCII("extension-mime-request-handling") ==
++      "always-prompt-for-install") {
++    return true;
++  }
+   // No allowed install sites specified, disallow by default.
+   if (!global_settings_->install_sources.has_value())
+     return false;
+@@ -367,31 +374,7 @@ bool ExtensionManagement::IsAllowedManifestVersion(
+     int manifest_version,
+     const std::string& extension_id,
+     Manifest::Type manifest_type) {
+-  bool enabled_by_default =
+-      !base::FeatureList::IsEnabled(
+-          extensions_features::kExtensionsManifestV3Only) ||
+-      manifest_version >= 3;
+-
+-  // Manifest version policy only supports normal extensions and Chrome OS login
+-  // screen extension.
+-  if (manifest_type != Manifest::Type::TYPE_EXTENSION &&
+-      manifest_type != Manifest::Type::TYPE_LOGIN_SCREEN_EXTENSION) {
+-    return enabled_by_default;
+-  }
+-  switch (global_settings_->manifest_v2_setting) {
+-    case internal::GlobalSettings::ManifestV2Setting::kDefault:
+-      return enabled_by_default;
+-    case internal::GlobalSettings::ManifestV2Setting::kDisabled:
+-      return manifest_version >= 3;
+-    case internal::GlobalSettings::ManifestV2Setting::kEnabled:
+       return true;
+-    case internal::GlobalSettings::ManifestV2Setting::kEnabledForForceInstalled:
+-      auto installation_mode =
+-          GetInstallationMode(extension_id, /*update_url=*/std::string());
+-      return manifest_version >= 3 ||
+-             installation_mode == ManagedInstallationMode::kForced ||
+-             installation_mode == ManagedInstallationMode::kRecommended;
+-  }
+ }
+ 
+ bool ExtensionManagement::IsAllowedManifestVersion(const Extension* extension) {
+@@ -412,26 +395,8 @@ bool ExtensionManagement::IsExemptFromMV2DeprecationByPolicy(
+     return false;
+   }
+ 
+-  switch (global_settings_->manifest_v2_setting) {
+-    case internal::GlobalSettings::ManifestV2Setting::kDefault:
+-      // Default browser behavior. Not exempt.
+-      return false;
+-    case internal::GlobalSettings::ManifestV2Setting::kDisabled:
+-      // All MV2 extensions are disallowed. Not exempt.
+-      return false;
+-    case internal::GlobalSettings::ManifestV2Setting::kEnabled:
+       // All MV2 extensions are allowed. Exempt.
+       return true;
+-    case internal::GlobalSettings::ManifestV2Setting::kEnabledForForceInstalled:
+-      // Force-installed MV2 extensions are allowed. Exempt if it's a force-
+-      // installed extension only.
+-      auto installation_mode =
+-          GetInstallationMode(extension_id, /*update_url=*/std::string());
+-      return installation_mode == ManagedInstallationMode::kForced ||
+-             installation_mode == ManagedInstallationMode::kRecommended;
+-  }
+-
+-  return false;
+ }
+ 
+ bool ExtensionManagement::IsAllowedByUnpublishedAvailabilityPolicy(
+@@ -476,6 +441,22 @@ bool ExtensionManagement::IsAllowedByUnpackedDeveloperModePolicy(
+   if (extension.location() != mojom::ManifestLocation::kUnpacked) {
+     return true;
+   }
++  // [MoCi ext-protect] locked extensions（魔词工作台等 bundled trusted ext）
++  // 跳过 dev mode 检查 — 否则 Reload 触发 unsupportedDeveloperExtension disable
++  // 必须放在 dev mode 读取之前，保证 dev mode toggle 任何状态都不影响 locked ext
++  {
++    auto* cmd = base::CommandLine::ForCurrentProcess();
++    if (cmd->HasSwitch(::switches::kMoCiLockedExtensions)) {
++      const std::string val =
++          cmd->GetSwitchValueASCII(::switches::kMoCiLockedExtensions);
++      for (const auto& id : base::SplitString(
++               val, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++        if (id == extension.id()) {
++          return true;
++        }
++      }
++    }
++  }
+   // Allow extensions loaded from DevTools' "Extensions.loadUnpacked" command.
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+           switches::kEnableUnsafeExtensionDebugging)) {

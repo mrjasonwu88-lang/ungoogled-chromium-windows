@@ -1,0 +1,24 @@
+diff --git a/chrome/browser/search/search.cc b/chrome/browser/search/search.cc
+index 398e67f9cb..8b3469f854 100644
+--- a/chrome/browser/search/search.cc
++++ b/chrome/browser/search/search.cc
+@@ -373,6 +373,19 @@ std::optional<GURL> GetEffectiveURLForInstant(const GURL& url,
+ 
+ bool HandleNewTabURLRewrite(GURL* url,
+                             content::BrowserContext* browser_context) {
++  // [MoCi newtab-redirect] MoCi env 强制把 chrome://newtab/ 重写到 https://home.moci/
++  // 扩展 chrome_url_overrides.newtab 被用户点"还原设置"后无法恢复，MV3 service worker
++  // 不会被 tabs.onCreated 自动唤醒所以 background.js 兜底也不可靠 — 唯有内核 navigation
++  // rewrite 层 100% 生效。复用 moci-ext-protect.patch 的 --moci-locked-extensions switch
++  // 做 gate（=MoCi env）。Non-MoCi chromium 跑这版二进制时 switch 缺席走原逻辑。
++  if (url->SchemeIs(content::kChromeUIScheme) &&
++      url->GetHost() == chrome::kChromeUINewTabHost &&
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          ::switches::kMoCiLockedExtensions)) {
++    *url = GURL("https://home.moci/");
++    return true;
++  }
++
+   if (!IsInstantExtendedAPIEnabled()) {
+     return false;
+   }

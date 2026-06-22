@@ -319,7 +319,7 @@ def main():
 
     # Run ninja
     if args.ci:
-        _run_build_process_timeout(*ninja_commandline, timeout=3.5*60*60)
+        _run_build_process_timeout(*ninja_commandline, timeout=24*60*60)  # MoCi: 3.5h -> 24h (local dev)
         # package
         os.chdir(_ROOT_DIR)
         subprocess.run([sys.executable, 'package.py'])

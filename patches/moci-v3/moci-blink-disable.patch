@@ -1,0 +1,444 @@
+diff --git a/third_party/blink/renderer/core/events/navigator_events.cc b/third_party/blink/renderer/core/events/navigator_events.cc
+index a57561775c..c9240ac424 100644
+--- a/third_party/blink/renderer/core/events/navigator_events.cc
++++ b/third_party/blink/renderer/core/events/navigator_events.cc
+@@ -30,6 +30,8 @@
+ 
+ #include "third_party/blink/renderer/core/events/navigator_events.h"
+ 
++#include "base/command_line.h"
++#include "components/moci/fingerprint_config.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+@@ -38,6 +40,19 @@
+ namespace blink {
+ 
+ int32_t NavigatorEvents::maxTouchPoints(Navigator& navigator) {
++  // [MoCi fp-32 B] navigator.maxTouchPoints from JSON (allow non-zero for
++  // touch device emulation). Fallback: force 0 (desktop) when JSON loaded
++  // but field missing; real device value otherwise.
++  auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++  if (auto* nav = dict.FindDict("navigator")) {
++    if (auto v = nav->FindInt("maxTouchPoints")) {
++      return static_cast<int32_t>(*v);
++    }
++  }
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    return 0;
++  }
+   LocalDOMWindow* window = navigator.DomWindow();
+   return window ? window->GetFrame()->GetSettings()->GetMaxTouchPoints() : 0;
+ }
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index 583f05f8dd..f2925411a1 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -45,9 +45,9 @@ String Navigator::productSub() const {
+ 
+ String Navigator::vendor() const {
+   // Do not change without good cause. History:
+-  // https://code.google.com/p/chromium/issues/detail?id=276813
++  // https://code.9oo91e.qjz9zk/p/chromium/issues/detail?id=276813
+   // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27786
+-  // https://groups.google.com/a/chromium.org/forum/#!topic/blink-dev/QrgyulnqvmE
++  // https://groups.9oo91e.qjz9zk/a/ch40m1um.qjz9zk/forum/#!topic/blink-dev/QrgyulnqvmE
+   return "Google Inc.";
+ }
+ 
+@@ -98,12 +98,11 @@ bool Navigator::cookieEnabled() const {
+ }
+ 
+ bool Navigator::webdriver() const {
+-  if (RuntimeEnabledFeatures::AutomationControlledEnabled())
+-    return true;
+-
+-  bool automation_enabled = false;
+-  probe::ApplyAutomationOverride(GetExecutionContext(), automation_enabled);
+-  return automation_enabled;
++  // MoCi fp-09: always return false so anti-bot scripts can't trivially
++  // detect automation. CDP / DevTools attachment still works; just the
++  // navigator.webdriver getter lies. (The automation framework is still
++  // detectable via timing / process probing, but those are out of scope here.)
++  return false;
+ }
+ 
+ String Navigator::GetAcceptLanguages() {
+diff --git a/third_party/blink/renderer/modules/battery/battery_manager.cc b/third_party/blink/renderer/modules/battery/battery_manager.cc
+index 51cdc75cee..aa326148be 100644
+--- a/third_party/blink/renderer/modules/battery/battery_manager.cc
++++ b/third_party/blink/renderer/modules/battery/battery_manager.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/modules/battery/battery_manager.h"
+ 
++#include "base/command_line.h"
+ #include "third_party/blink/public/mojom/frame/lifecycle.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+@@ -22,6 +23,19 @@ const char BatteryManager::kSupplementName[] = "BatteryManager";
+ ScriptPromise<BatteryManager> BatteryManager::getBattery(
+     ScriptState* script_state,
+     Navigator& navigator) {
++  // MoCi fp-19: disable Battery API entirely when --fingerprint-config is set.
++  // Battery level + charging state is a high-entropy fingerprint signal
++  // (especially with timing/discharge curve). Brave disabled it by default,
++  // we follow suit. Sites that need battery get a rejected promise.
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    return ScriptPromise<BatteryManager>::RejectWithDOMException(
++        script_state,
++        DOMException::Create(
++            "Battery Status API is disabled.",
++            DOMException::GetErrorName(DOMExceptionCode::kNotSupportedError)));
++  }
++
+   if (!navigator.DomWindow())
+     return EmptyPromise();
+ 
+diff --git a/third_party/blink/renderer/modules/bluetooth/bluetooth.cc b/third_party/blink/renderer/modules/bluetooth/bluetooth.cc
+index 4bf4df11b2..e6b8c7186d 100644
+--- a/third_party/blink/renderer/modules/bluetooth/bluetooth.cc
++++ b/third_party/blink/renderer/modules/bluetooth/bluetooth.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "build/build_config.h"
+ #include "mojo/public/cpp/bindings/associated_receiver_set.h"
+ #include "mojo/public/cpp/bindings/pending_associated_remote.h"
+@@ -405,6 +406,15 @@ ScriptPromise<BluetoothDevice> Bluetooth::requestDevice(
+     ScriptState* script_state,
+     const RequestDeviceOptions* options,
+     ExceptionState& exception_state) {
++  // MoCi fp-20: disable Web Bluetooth when --fingerprint-config is set.
++  // Bluetooth adapter info is a strong machine signature; Amazon never uses
++  // Web Bluetooth in its seller flow, so hiding it is pure win.
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    exception_state.ThrowSecurityError("Web Bluetooth is disabled.");
++    return EmptyPromise();
++  }
++
+   LocalDOMWindow* window = GetSupplementable()->DomWindow();
+ 
+   if (IsRequestDenied(window, exception_state)) {
+diff --git a/third_party/blink/renderer/modules/compute_pressure/pressure_observer.cc b/third_party/blink/renderer/modules/compute_pressure/pressure_observer.cc
+index ea2db8e128..89d362b613 100644
+--- a/third_party/blink/renderer/modules/compute_pressure/pressure_observer.cc
++++ b/third_party/blink/renderer/modules/compute_pressure/pressure_observer.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ 
++#include "base/command_line.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+@@ -55,6 +56,13 @@ ScriptPromise<IDLUndefined> PressureObserver::observe(
+     V8PressureSource source,
+     PressureObserverOptions* options,
+     ExceptionState& exception_state) {
++  // MoCi fp-34: disable PressureObserver (CPU pressure leak = fingerprint).
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kNotSupportedError,
++                                      "PressureObserver disabled.");
++    return EmptyPromise();
++  }
+   ExecutionContext* execution_context = ExecutionContext::From(script_state);
+   if (execution_context->IsContextDestroyed()) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kNotSupportedError,
+diff --git a/third_party/blink/renderer/modules/idle/idle_detector.cc b/third_party/blink/renderer/modules/idle/idle_detector.cc
+index d2807edd83..dc28581eb7 100644
+--- a/third_party/blink/renderer/modules/idle/idle_detector.cc
++++ b/third_party/blink/renderer/modules/idle/idle_detector.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -130,6 +131,13 @@ ScriptPromise<IDLUndefined> IdleDetector::start(
+     ScriptState* script_state,
+     const IdleOptions* options,
+     ExceptionState& exception_state) {
++  // MoCi fp-34: disable IdleDetector (user activity leak = fingerprint).
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    exception_state.ThrowDOMException(DOMExceptionCode::kNotAllowedError,
++                                      "IdleDetector disabled.");
++    return EmptyPromise();
++  }
+   if (!GetExecutionContext() || GetExecutionContext()->IsContextDestroyed()) {
+     exception_state.ThrowDOMException(DOMExceptionCode::kInvalidStateError,
+                                       "Execution context is detached.");
+diff --git a/third_party/blink/renderer/modules/mediastream/media_devices.cc b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+index 18855d9d71..f103fc11c4 100644
+--- a/third_party/blink/renderer/modules/mediastream/media_devices.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+@@ -7,11 +7,14 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/notreached.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/stringprintf.h"
++#include "components/moci/fingerprint_config.h"  // [.200 KYC] passthrough
++#include "components/moci/fingerprint_helpers.h"  // [Phase 3-B B-3] spoofed devices
+ #include "base/uuid.h"
+ #include "build/build_config.h"
+ #include "media/base/media_permission.h"
+@@ -551,6 +554,33 @@ ScriptPromise<IDLSequence<MediaDeviceInfo>> MediaDevices::enumerateDevices(
+             kEnumerateDevicesTimeout + base::Milliseconds(100));
+   }
+ 
++  // === MoCi Browser: MediaDevices Spoofing (Phase 3-B B-3) ===
++  // 之前只配数量 chromium 自己造的 deviceId/groupId/label 跨 env 不稳定
++  // 升级 fp-B-3：用 kernel-manager.ts 派生的 device 池（含 4×FNV-1a deviceId / OS 命名 label）
++  // passthrough=true (KYC 场景) 时不覆盖走原生
++  if (moci::ShouldOverrideMediaDevices()) {
++    const auto spoofed = moci::GetSpoofedMediaDevices();
++    MediaDeviceInfoVector media_devices;
++    for (const auto& d : spoofed) {
++      mojom::blink::MediaDeviceType kind =
++          mojom::blink::MediaDeviceType::kMediaAudioInput;
++      if (d.kind == "audiooutput") {
++        kind = mojom::blink::MediaDeviceType::kMediaAudioOutput;
++      } else if (d.kind == "videoinput") {
++        kind = mojom::blink::MediaDeviceType::kMediaVideoInput;
++      }
++      media_devices.push_back(MakeGarbageCollected<MediaDeviceInfo>(
++          String::FromUtf8(d.device_id),
++          String::FromUtf8(d.label),
++          String::FromUtf8(d.group_id),
++          kind));
++    }
++    enumerate_device_requests_.erase(result_tracker);
++    result_tracker->Resolve(media_devices);
++    return promise;
++  }
++  // === End MoCi Browser Modification ===
++
+   LocalFrame* frame = LocalDOMWindow::From(script_state)->GetFrame();
+   GetDispatcherHost(frame).EnumerateDevices(
+       /*request_audio_input=*/true, /*request_video_input=*/true,
+@@ -1477,6 +1507,38 @@ void MediaDevices::DevicesEnumerated(
+     }
+   }
+ 
++  // MoCi fp-12: replace the real device enumeration with a fixed generic
++  // 3-device list so device count / IDs / labels can't be used to fingerprint
++  // or correlate environments. The replacement looks like a fresh install of
++  // chrome on a basic desktop: 1 audio input, 1 video input, 1 audio output,
++  // all with empty labels (matches the unprivileged default chromium returns
++  // when getUserMedia hasn't been granted).
++  //
++  // [.200 KYC passthrough]: 当 fp config 含 mediaDevices.passthrough=true 时
++  // 跳过 spoof，走原生 chromium 真实硬件枚举。用于 walmart / 亚马逊等平台
++  // 卖家 KYC 实人视频验证（默认 false 保持指纹保护）。
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    bool media_devices_passthrough = false;
++    const auto& fp_dict = moci::MoCiFingerprintConfig::Get().GetDict();
++    if (const auto* media = fp_dict.FindDict("mediaDevices")) {
++      media_devices_passthrough = media->FindBool("passthrough").value_or(false);
++    }
++    if (!media_devices_passthrough) {
++      media_devices.clear();
++      media_devices.push_back(MakeGarbageCollected<InputDeviceInfo>(
++          String("default"), String(""), String(""),
++          mojom::blink::MediaDeviceType::kMediaAudioInput));
++      media_devices.push_back(MakeGarbageCollected<InputDeviceInfo>(
++          String("default"), String(""), String(""),
++          mojom::blink::MediaDeviceType::kMediaVideoInput));
++      media_devices.push_back(MakeGarbageCollected<MediaDeviceInfo>(
++          String("default"), String(""), String(""),
++          mojom::blink::MediaDeviceType::kMediaAudioOutput));
++      result_contains_nonempty_input_device_ids = false;
++    }
++  }
++
+   ReportCompletedEnumerateDevices(result_contains_nonempty_input_device_ids);
+   result_tracker->Resolve(media_devices);
+   tracer->End();
+diff --git a/third_party/blink/renderer/modules/permissions/permissions.cc b/third_party/blink/renderer/modules/permissions/permissions.cc
+index 378eaa2bde..138bddc116 100644
+--- a/third_party/blink/renderer/modules/permissions/permissions.cc
++++ b/third_party/blink/renderer/modules/permissions/permissions.cc
+@@ -7,6 +7,8 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "third_party/blink/public/common/permissions/permission_utils.h"
+ #include "third_party/blink/public/mojom/page/page.mojom-blink.h"
+@@ -119,6 +121,43 @@ ScriptPromise<PermissionStatus> Permissions::query(
+           script_state, exception_state.GetContext());
+   auto promise = resolver->Promise();
+ 
++  // === MoCi Browser: Permissions Spoofing (Phase 3-A A-4) ===
++  // 之前 fp-21 老方案：全部权限返 ASK（=prompt）
++  //   → 11 项全 prompt = incognito 特征被 CreepJS / FingerprintJS Pro 识破
++  // 升级 fp-A-4：按 W3C 权限名查 OLD_USER_PROFILE 派生 state（long-term Chrome 用户画像）
++  //   notifications/geolocation/camera/microphone/midi/clipboard-read/push: prompt
++  //   persistent-storage/accelerometer/gyroscope/background-sync: granted
++  if (moci::ShouldOverrideWebPermissions()) {
++    // chromium PermissionName enum → W3C 标准字符串（kernel-manager.ts 用 W3C 名 keying）
++    const char* w3c_name = nullptr;
++    switch (descriptor->name) {
++      case PermissionName::GEOLOCATION: w3c_name = "geolocation"; break;
++      case PermissionName::NOTIFICATIONS: w3c_name = "notifications"; break;
++      case PermissionName::VIDEO_CAPTURE: w3c_name = "camera"; break;
++      case PermissionName::AUDIO_CAPTURE: w3c_name = "microphone"; break;
++      case PermissionName::MIDI: w3c_name = "midi"; break;
++      case PermissionName::CLIPBOARD_READ: w3c_name = "clipboard-read"; break;
++      case PermissionName::CLIPBOARD_WRITE: w3c_name = "clipboard-read"; break;  // 同源
++      case PermissionName::PERSISTENT_STORAGE: w3c_name = "persistent-storage"; break;
++      case PermissionName::SENSORS: w3c_name = "accelerometer"; break;  // SENSORS 通用 → accelerometer
++      case PermissionName::BACKGROUND_SYNC: w3c_name = "background-sync"; break;
++      default: break;
++    }
++    std::string state;
++    if (w3c_name) state = moci::GetWebPermissionState(w3c_name);
++    if (state.empty()) state = "prompt";  // 未覆盖的权限 fallback prompt
++    mojom::blink::PermissionStatus status = mojom::blink::PermissionStatus::ASK;
++    if (state == "granted") {
++      status = mojom::blink::PermissionStatus::GRANTED;
++    } else if (state == "denied") {
++      status = mojom::blink::PermissionStatus::DENIED;
++    }
++    PermissionDescriptorPtr desc_copy = descriptor->Clone();
++    TaskComplete(resolver, std::move(desc_copy), status);
++    return promise;
++  }
++  // === End MoCi Browser Modification ===
++
+   // If the current origin is a file scheme, it will unlikely return a
+   // meaningful value because most APIs are broken on file scheme and no
+   // permission prompt will be shown even if the returned permission will most
+diff --git a/third_party/blink/renderer/modules/quota/storage_manager.cc b/third_party/blink/renderer/modules/quota/storage_manager.cc
+index ef1c723ac2..4ef3ca42b9 100644
+--- a/third_party/blink/renderer/modules/quota/storage_manager.cc
++++ b/third_party/blink/renderer/modules/quota/storage_manager.cc
+@@ -4,6 +4,11 @@
+ 
+ #include "third_party/blink/renderer/modules/quota/storage_manager.h"
+ 
++#include <functional>
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "components/moci/fingerprint_config.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
+ #include "third_party/blink/public/mojom/quota/quota_types.mojom-blink.h"
+@@ -169,6 +174,47 @@ ScriptPromise<StorageEstimate> StorageManager::estimate(
+       script_state, exception_state.GetContext());
+   auto promise = resolver->Promise();
+ 
++  // [MoCi fp-29 B] storage.estimate() quota — read storage.quotaGB from JSON
++  // (in GB; converted to bytes). Fallback: per-env pool.
++  // 2026-05-29 修复：callback 第 5 参 UsageBreakdownPtr 不能传 nullptr，
++  // 否则 QueryStorageUsageAndQuotaCallback 内部 `usage_breakdown->indexedDatabase`
++  // 立刻 deref null 让渲染进程崩 (whoer.net/amiunique.org 实测复现)。
++  // 必须传 UsageBreakdown::New() 零初始化对象让 callback 内部 if 检查走 false 分支。
++  {
++    auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++    if (auto* st = dict.FindDict("storage")) {
++      if (auto v = st->FindInt("quotaGB")) {
++        int64_t bytes = static_cast<int64_t>(*v) * 1024LL * 1024 * 1024;
++        QueryStorageUsageAndQuotaCallback(
++            resolver, mojom::blink::QuotaStatusCode::kOk, 0, bytes,
++            mojom::blink::UsageBreakdown::New());
++        return promise;
++      }
++    }
++  }
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    auto p = cmd->GetSwitchValuePath("fingerprint-config");
++    if (!p.empty()) {
++      static constexpr int64_t kQuotaPool[] = {
++        60LL  * 1024 * 1024 * 1024,
++        120LL * 1024 * 1024 * 1024,
++        256LL * 1024 * 1024 * 1024,
++        500LL * 1024 * 1024 * 1024,
++        1024LL * 1024 * 1024 * 1024,
++        120LL * 1024 * 1024 * 1024,
++        256LL * 1024 * 1024 * 1024,
++        500LL * 1024 * 1024 * 1024,
++      };
++      auto seed = std::hash<base::FilePath::StringType>{}(p.value());
++      QueryStorageUsageAndQuotaCallback(
++          resolver, mojom::blink::QuotaStatusCode::kOk, 0,
++          kQuotaPool[seed % std::size(kQuotaPool)],
++          mojom::blink::UsageBreakdown::New());
++      return promise;
++    }
++  }
++
+   auto callback = resolver->WrapCallbackInScriptScope(
+       BindOnce(&QueryStorageUsageAndQuotaCallback));
+   GetQuotaHost(execution_context)
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 2327015bc5..93f9581220 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -27,7 +27,9 @@
+ 
+ #include <tuple>
+ 
++#include "base/command_line.h"
+ #include "build/build_config.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -96,7 +98,36 @@ void SpeechSynthesis::OnSetVoiceList(
+ }
+ 
+ const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
+-  // Kick off initialization here to ensure voice list gets populated.
++  // === MoCi Browser: SpeechSynthesis Voices Spoofing (Phase 3-A A-3) ===
++  // 之前 fp-13 老方案：fingerprint-config 存在时返空 voice_list_
++  //   → voices=0 在 CreepJS / BrowserScan 被识破"Linux 或异常"
++  // 升级 fp-A-3：按 mode 三档
++  //   disabled → 空 list（业务允许牺牲 TTS 的场景）
++  //   privacy  → 用 JSON 池里的 voices（按 OS 真实分布派生 Win11≈17 / MacM1≈22 / Linux≈3）
++  //   real     → 走原生 TryEnsureMojomSynthesis 暴露真实 OS voices
++  if (moci::ShouldDisableWebSpeechVoices()) {
++    voice_list_.clear();
++    return voice_list_;
++  }
++  if (moci::ShouldOverrideWebSpeechVoices()) {
++    // Lazy 填充 spoofed voices（第一次调用时构造，后续返同一列表）
++    if (voice_list_.empty()) {
++      const auto voices = moci::GetWebSpeechVoices();
++      for (const auto& v : voices) {
++        auto mojo_voice = mojom::blink::SpeechSynthesisVoice::New();
++        mojo_voice->name = String::FromUtf8(v.name);
++        mojo_voice->lang = String::FromUtf8(v.lang);
++        mojo_voice->voice_uri = String::FromUtf8(v.voice_uri);
++        mojo_voice->is_local_service = v.local_service;
++        mojo_voice->is_default = v.default_voice;
++        voice_list_.push_back(
++            MakeGarbageCollected<SpeechSynthesisVoice>(std::move(mojo_voice)));
++      }
++    }
++    return voice_list_;
++  }
++  // === End MoCi Browser Modification ===
++  // mode == "real" 或未配置 → 走原生
+   std::ignore = TryEnsureMojomSynthesis();
+   return voice_list_;
+ }

@@ -1,0 +1,209 @@
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index d683cdd958..8a6e8fd465 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -57,6 +57,8 @@
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/common/crash_keys.h"
+ #include "chrome/common/logging_chrome.h"
++#include "components/moci/fingerprint_config.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "chrome/common/profiler/chrome_thread_group_profiler_client.h"
+ #include "chrome/common/profiler/chrome_thread_profiler_client.h"
+ #include "chrome/common/profiler/core_unwinders.h"
+@@ -1333,6 +1335,64 @@ void ChromeMainDelegate::PreSandboxStartup() {
+   std::string process_type =
+       command_line.GetSwitchValueASCII(switches::kProcessType);
+ 
++  // MoCi: load --fingerprint-config JSON into the process-wide singleton.
++  // Idempotent: re-entered by every process type (browser/renderer/utility/gpu)
++  // but Init() ignores second call. Each process inherits the switch via
++  // Chromium's default child command line propagation.
++  moci::MoCiFingerprintConfig::Init(
++      command_line.GetSwitchValuePath(switches::kFingerprintConfig));
++
++  // [MoCi v.215 V8 Math hook] 让 V8 base/ieee754.cc 里 8 个 transcendental
++  // (acos/atanh/expm1/log1p/log2/log10/sinh/cosh) 主返回路径加 1-2 bit 末位 noise
++  // per envId-derived seed → 真实风控站 (CreepJS/BrowserScan/FingerprintJS) 抓
++  // Math.acos(0.123).slice(-12) 跨 env 不同。V8 base/ieee754.cc 自己读
++  // MOCI_MATH_NOISE_SEED env var (避免 chrome layer cross-deps V8 internal header)。
++  // fail-safe: 没 config / seed=0 → 返原值。
++  {
++    char seed_buf[32];
++    snprintf(seed_buf, sizeof(seed_buf), "%u", moci::GetMathNoiseSeed());
++#if BUILDFLAG(IS_WIN)
++    _putenv_s("MOCI_MATH_NOISE_SEED", seed_buf);
++#else
++    setenv("MOCI_MATH_NOISE_SEED", seed_buf, 1);
++#endif
++  }
++
++  // [MoCi v.216 Phase 5 #2] WASM features mask
++  // V8 wasm/wasm-features.cc 自己读 MOCI_WASM_FEATURES_MASK env var (hex 32-bit)
++  // FromFlags / FromContext 返回前按 mask bit i 调用 Remove(WasmEnabledFeature(i))
++  // 关掉 flagged experimental features，跨 env featuresMask 不同 → wasm hash 不同
++  // always-enabled features (SIMD/GC/threads/memory64) V8 硬编码不可控
++  // fail-safe: 没 config / mask=0 → 返 0 即不动 features
++  {
++    char mask_buf[32];
++    snprintf(mask_buf, sizeof(mask_buf), "%x", moci::GetWasmFeaturesMask());
++#if BUILDFLAG(IS_WIN)
++    _putenv_s("MOCI_WASM_FEATURES_MASK", mask_buf);
++#else
++    setenv("MOCI_WASM_FEATURES_MASK", mask_buf, 1);
++#endif
++  }
++
++  // [MoCi fp-08] Export the fingerprint-config path as env var so BoringSSL
++  // (which can't depend on //base) can read it via getenv() to derive a
++  // deterministic TLS GREASE seed per environment. Without this, TLS GREASE
++  // values vary per handshake → JA3 hash unstable. With this, JA3 hash is
++  // stable within an environment and varies across environments. Set in
++  // PreSandboxStartup so the value is in env before any child process spawns
++  // or sandbox lockdown happens.
++  {
++    auto fp_path = command_line.GetSwitchValueNative(
++        switches::kFingerprintConfig);
++    if (!fp_path.empty()) {
++#if BUILDFLAG(IS_WIN)
++      _wputenv_s(L"MOCI_FINGERPRINT_CONFIG_PATH", fp_path.c_str());
++#else
++      setenv("MOCI_FINGERPRINT_CONFIG_PATH", fp_path.c_str(), 1);
++#endif
++    }
++  }
++
+   crash_reporter::InitializeCrashKeys();
+ 
+ #if BUILDFLAG(IS_POSIX)
+@@ -1510,6 +1570,11 @@ void ChromeMainDelegate::SandboxInitialized(const std::string& process_type) {
+   SuppressWindowsErrorDialogs();
+ #endif
+ 
++  // MoCi: surface fingerprint-config load status now that logging is wired up.
++  // Init() ran earlier in PreSandboxStartup but any LOG() it emitted was lost
++  // on Windows because InitLogging runs here in SandboxInitialized.
++  moci::MoCiFingerprintConfig::Get().LogStatus();
++
+   // If this is a browser process, initialize the persistent histograms system
+   // unless headless mode is in effect. This is done as soon as possible to
+   // ensure metrics collection coverage. For Fuchsia, persistent histogram
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index f823433796..63ec566256 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2838,6 +2838,10 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+   static const char* const kCommonSwitchNames[] = {
+       embedder_support::kUserAgent,
+       switches::kUserDataDir,  // Make logs go to the right file.
++      // MoCi: per-env fingerprint config path. Document() 构造里 hash 此路径
++      // 派生 noise_factor_x_/y_，让 getBoundingClientRect/measureText/
++      // offsetWidth 跨 env 输出不同（F 方案核心）。必须 forward 给 renderer。
++      "fingerprint-config",
+   };
+   command_line->CopySwitchesFrom(browser_command_line, kCommonSwitchNames);
+ 
+diff --git a/chrome/common/BUILD.gn b/chrome/common/BUILD.gn
+index 1a692fe440..fcafd55d15 100644
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -120,7 +120,6 @@ source_set("request_code_constants") {
+ static_library("common_lib") {
+   visibility = [
+     ":*",
+-    "//chrome/common/win:eventlog_messages",
+   ]
+   sources = [
+     "actor/action_result.cc",
+@@ -366,7 +365,6 @@ static_library("common_lib") {
+       "conflicts/remote_module_watcher_win.cc",
+       "conflicts/remote_module_watcher_win.h",
+     ]
+-    deps += [ "//chrome/common/win:eventlog_messages" ]
+ 
+     public_deps += [
+       "//components/dom_distiller/core",  # Needed by chrome_content_client.cc.
+@@ -457,6 +455,7 @@ static_library("non_code_constants") {
+     ":buildflags",
+     ":version_header",
+     "//base",
++    "//components/moci:fingerprint_config",  # [MoCi B] expose MoCiFingerprintConfig
+     "//content/public/common:buildflags",
+   ]
+ 
+@@ -531,6 +530,7 @@ static_library("url_constants") {
+     "//components/optimization_guide/optimization_guide_internals/webui:url_constants",
+     "//components/password_manager/content/common",
+     "//components/safe_browsing/core/common",
++    "//components/supervised_user/core/common:buildflags",
+     "//device/vr/buildflags",
+   ]
+ 
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 90108a2035..d009f2506d 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -58,6 +58,11 @@ const char kApp[] = "app";
+ // according to its configuration.
+ const char kAppId[] = "app-id";
+ 
++// [MoCi ext-protect] Comma-separated extension IDs that cannot be uninstalled,
++// disabled, or unpinned by the user. Combined with the bundled 魔词工作台
++// extension to make it appear native (no "Remove" button in chrome://extensions).
++const char kMoCiLockedExtensions[] = "moci-locked-extensions";
++
+ // Overrides the launch url of an app with the specified url. This is used
+ // along with kAppId to launch a given app with the url corresponding to an item
+ // in the app's shortcuts menu.
+@@ -322,6 +327,12 @@ const char kExtensionContentVerificationEnforceStrict[] = "enforce_strict";
+ // Name of the command line flag to allow the experimental actor API.
+ const char kExtensionExperimentalActor[] = "enable-extension-actor-api";
+ 
++// MoCi: Path to fingerprint configuration JSON file.
++// Per-environment 166-field config consumed by Canvas/Audio/WebGL/Font/TLS/...
++// patches. See moci-chromium-patches/docs/fingerprint-config-schema.json for
++// the JSON schema. Loaded once at process start by MoCiFingerprintConfig.
++const char kFingerprintConfig[] = "fingerprint-config";
++
+ // Specifies the variation of Zero State extensions toolbar recommendation to
+ // show.
+ // When a user with zero extensions installed clicks on the extensions puzzle
+@@ -354,7 +365,7 @@ const char kHideCrashRestoreBubble[] = "hide-crash-restore-bubble";
+ 
+ // Specifies which page will be displayed in newly-opened tabs. We need this
+ // for testing purposes so that the UI tests don't depend on what comes up for
+-// http://google.com.
++// http://9oo91e.qjz9zk.
+ const char kHomePage[] = "homepage";
+ 
+ #if !BUILDFLAG(IS_ANDROID)
+@@ -475,7 +486,7 @@ const char kOpenInNewWindow[] = "new-window";
+ // Activates an existing tab or app window by URL or app id before creating
+ // anything new. Syntax: comma-ordered selectors. Bare URLs are exact.
+ // Add a trailing * for prefix. app:<app-id> targets PWAs.
+-// Example: --focus=https://meet.google.com/*,app:abc123
++// Example: --focus=https://meet.9oo91e.qjz9zk/*,app:abc123
+ const char kFocus[] = "focus";
+ 
+ // Specifies a file path to write JSON focus result information.
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 53fd53ab4a..88fa55082f 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -45,6 +45,7 @@ extern const char kAllowRunningInsecureContent[];
+ extern const char kAllowSilentPush[];
+ extern const char kApp[];
+ extern const char kAppId[];
++extern const char kMoCiLockedExtensions[];  // [MoCi ext-protect]
+ extern const char kAppLaunchUrlForShortcutsMenuItem[];
+ extern const char kAppRunOnOsLoginMode[];
+ extern const char kAppShim[];
+@@ -115,6 +116,8 @@ extern const char kExtensionContentVerificationBootstrap[];
+ extern const char kExtensionContentVerificationEnforce[];
+ extern const char kExtensionContentVerificationEnforceStrict[];
+ extern const char kExtensionExperimentalActor[];
++// MoCi: Path to fingerprint configuration JSON file.
++extern const char kFingerprintConfig[];
+ extern const char kForceAppMode[];
+ #if BUILDFLAG(IS_CHROMEOS)
+ extern const char kForceDevToolsAvailable[];

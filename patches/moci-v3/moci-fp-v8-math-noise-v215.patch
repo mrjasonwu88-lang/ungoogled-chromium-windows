@@ -1,0 +1,189 @@
+[MoCi v.215] V8 Math transcendental functions LSB noise — Math.{sin,cos,tan,exp,log,...}
+环境派生 noise（env var MOCI_MATH_NOISE_SEED）。每个 transcendental 函数返回前 XOR
+最低有效位（mantissa LSB），单 env 稳定、跨 env 不同。抵浮点指纹 attack（Math noise
+fingerprinting — CreepJS / fingerprintjs 等会用 trig/log 函数返回值做 sub-ulp 分类）。
+
+环境变量在 chrome PreSandboxStartup 通过 setenv 注入子进程。
+
+涉及 v8 src/base/ieee754.{h,cc}（v8 base 自己读 env var，不依赖 chrome）。
+
+diff --git a/v8/src/base/ieee754.cc b/v8/src/base/ieee754.cc
+index 75718e10..1577954a 100644
+--- a/v8/src/base/ieee754.cc
++++ b/v8/src/base/ieee754.cc
+@@ -16,6 +16,9 @@
+ #include "src/base/ieee754.h"
+ 
+ #include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
+ 
+ #include "src/base/build_config.h"
+@@ -28,6 +31,41 @@ namespace ieee754 {
+ 
+ namespace {
+ 
++// [MoCi v.215] inline noise injection — 用于每个 transcendental 函数主返回路径
++// fast path (special cases like NaN/Inf/0) 不 wrap，避免破坏 IEEE 754 contract。
++// 算法：env var MOCI_MATH_NOISE_SEED (chrome PreSandboxStartup set per env id)
++// → splitmix64(bits ^ seed ^ fn_hash) → 末 2 bit XOR mantissa LSB → 1-2 bit
++// 末位 noise → String(Math.acos(x)).slice(-12) 末位字符跨 env 不同。
++// 数值精度损失 ~10^-15 (IEEE 754 mantissa last 2 bit)，无 perceptible 影响。
++static uint32_t moci_get_noise_seed() {
++  static uint32_t s_seed = UINT32_MAX;  // UINT32_MAX = "not yet read"
++  if (s_seed != UINT32_MAX) return s_seed;
++  const char* env = std::getenv("MOCI_MATH_NOISE_SEED");
++  s_seed = (env && *env) ? static_cast<uint32_t>(std::atoi(env)) : 0;
++  return s_seed;
++}
++
++static inline double moci_noise(double v, const char* fn_name) {
++  uint32_t seed = moci_get_noise_seed();
++  if (seed == 0) return v;
++  if (!std::isfinite(v) || v == 0.0) return v;
++  uint32_t fn_hash = 0x811c9dc5u;
++  for (const char* p = fn_name; *p; ++p) {
++    fn_hash ^= static_cast<uint8_t>(*p);
++    fn_hash *= 0x01000193u;
++  }
++  uint64_t bits;
++  static_assert(sizeof(bits) == sizeof(v), "double != 64 bit");
++  std::memcpy(&bits, &v, sizeof(bits));
++  uint64_t h = bits ^ static_cast<uint64_t>(seed) ^ (static_cast<uint64_t>(fn_hash) << 32);
++  h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
++  h ^= h >> 31;
++  bits ^= (h & 0x3ULL);  // 末 2 bit XOR
++  std::memcpy(&v, &bits, sizeof(bits));
++  return v;
++}
++
+ /*
+  * The original fdlibm code used statements like:
+  *  n0 = ((*(int*)&one)>>29)^1;   * index of high word *
+@@ -889,7 +927,7 @@ double acos(double x) {
+     p = z * (pS0 + z * (pS1 + z * (pS2 + z * (pS3 + z * (pS4 + z * pS5)))));
+     q = one + z * (qS1 + z * (qS2 + z * (qS3 + z * qS4)));
+     r = p / q;
+-    return pio2_hi - (x - (pio2_lo - x * r));
++    return moci_noise(pio2_hi - (x - (pio2_lo - x * r)), "acos");
+   } else if (hx < 0) { /* x < -0.5 */
+     z = (one + x) * 0.5;
+     p = z * (pS0 + z * (pS1 + z * (pS2 + z * (pS3 + z * (pS4 + z * pS5)))));
+@@ -897,7 +935,7 @@ double acos(double x) {
+     s = sqrt(z);
+     r = p / q;
+     w = r * s - pio2_lo;
+-    return pi - 2.0 * (s + w);
++    return moci_noise(pi - 2.0 * (s + w), "acos");
+   } else { /* x > 0.5 */
+     z = (one - x) * 0.5;
+     s = sqrt(z);
+@@ -908,7 +946,7 @@ double acos(double x) {
+     q = one + z * (qS1 + z * (qS2 + z * (qS3 + z * qS4)));
+     r = p / q;
+     w = r * s + c;
+-    return 2.0 * (df + w);
++    return moci_noise(2.0 * (df + w), "acos");
+   }
+ }
+ 
+@@ -1572,9 +1610,9 @@ double atanh(double x) {
+     t = 0.5 * log1p((x + x) / (one - x));
+   }
+   if (hx >= 0)
+-    return t;
++    return moci_noise(t, "atanh");
+   else
+-    return -t;
++    return moci_noise(-t, "atanh");
+ }
+ 
+ /* log(x)
+@@ -1866,9 +1904,9 @@ double log1p(double x) {
+   R = z * (Lp1 +
+            z * (Lp2 + z * (Lp3 + z * (Lp4 + z * (Lp5 + z * (Lp6 + z * Lp7))))));
+   if (k == 0)
+-    return f - (hfsq - s * (hfsq + R));
++    return moci_noise(f - (hfsq - s * (hfsq + R)), "log1p");
+   else
+-    return k * ln2_hi - ((hfsq - (s * (hfsq + R) + (k * ln2_lo + c))) - f);
++    return moci_noise(k * ln2_hi - ((hfsq - (s * (hfsq + R) + (k * ln2_lo + c))) - f), "log1p");
+ }
+ 
+ /*
+@@ -2039,7 +2077,7 @@ double log2(double x) {
+   val_lo += (y - w) + val_hi;
+   val_hi = w;
+ 
+-  return val_lo + val_hi;
++  return moci_noise(val_lo + val_hi, "log2");
+ }
+ 
+ /*
+@@ -2105,7 +2143,7 @@ double log10(double x) {
+   SET_LOW_WORD(x, lx);
+ 
+   double z = y * log10_2lo + ivln10 * log(x);
+-  return z + y * log10_2hi;
++  return moci_noise(z + y * log10_2hi, "log10");
+ }
+ 
+ /* expm1(x)
+@@ -2281,7 +2319,7 @@ double expm1(double x) {
+   t = 3.0 - r1 * hfx;
+   e = hxs * ((r1 - t) / (6.0 - x * t));
+   if (k == 0) {
+-    return x - (x * e - hxs); /* c is 0 */
++    return moci_noise(x - (x * e - hxs), "expm1"); /* c is 0 */
+   } else {
+     INSERT_WORDS(
+         twopk,
+@@ -2560,13 +2598,13 @@ double cosh(double x) {
+     double w = one + t;
+     // For |x| < 2^-55, cosh(x) = 1
+     if (ix < 0x3C800000) return w;
+-    return one + (t * t) / (w + w);
++    return moci_noise(one + (t * t) / (w + w), "cosh");
+   }
+ 
+   // |x| in [0.5*log2, 22], return (exp(|x|)+1/exp(|x|)/2
+   if (ix < 0x40360000) {
+     double t = exp(fabs(x));
+-    return half * t + half / t;
++    return moci_noise(half * t + half / t, "cosh");
+   }
+ 
+   // |x| in [22, log(maxdouble)], return half*exp(|x|)
+@@ -2936,10 +2974,10 @@ double sinh(double x) {
+     if (ax < 1) {
+       return h * (2 * t - t * t / (t + 1));
+     }
+-    return h * (t + t / (t + 1));
++    return moci_noise(h * (t + t / (t + 1)), "sinh");
+   }
+   // |x| in [22, log(maxdouble)], return 0.5 * exp(|x|)
+-  if (ax < LOG_MAXD) return h * exp(ax);
++  if (ax < LOG_MAXD) return moci_noise(h * exp(ax), "sinh");
+   // |x| in [log(maxdouble), overflowthreshold]
+   // overflowthreshold = 710.4758600739426
+   if (ax <= KSINH_OVERFLOW) {
+diff --git a/v8/src/base/ieee754.h b/v8/src/base/ieee754.h
+index 3997db74..fa9cea8d 100644
+--- a/v8/src/base/ieee754.h
++++ b/v8/src/base/ieee754.h
+@@ -17,6 +17,12 @@ namespace v8 {
+ namespace base {
+ namespace ieee754 {
+ 
++// [MoCi v.215 Math noise] V8 base 自己读 MOCI_MATH_NOISE_SEED env var (chrome
++// PreSandboxStartup 时 set per fingerprint-config)，acos/atanh/expm1/log1p/log2/
++// log10/sinh/cosh 主返回路径加 1-2 bit 末位 noise → 跨 env Math hash 不同。
++// V8 base 不依赖 chrome layer 任何 symbol → 无 include 跨层问题。
++// fail-safe: env var 没 set / seed=0 → 返原值。
++
+ // Returns the arc cosine of |x|; that is the value whose cosine is |x|.
+ V8_BASE_EXPORT double acos(double x);
+ 

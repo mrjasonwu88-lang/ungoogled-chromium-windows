@@ -1,0 +1,73 @@
+diff --git a/v8/src/wasm/wasm-features.cc b/v8/src/wasm/wasm-features.cc
+index 558e0572..60e15ed1 100644
+--- a/v8/src/wasm/wasm-features.cc
++++ b/v8/src/wasm/wasm-features.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "src/wasm/wasm-features.h"
+ 
++#include <cstdlib>
++
+ #include "src/execution/isolate-inl.h"
+ #include "src/flags/flags.h"
+ #include "src/handles/handles-inl.h"
+@@ -13,6 +15,22 @@ namespace v8 {
+ namespace internal {
+ namespace wasm {
+ 
++namespace {
++// [MoCi v.216 WASM features mask] flagged features 按 envId 派生 mask
++// chrome PreSandboxStartup 时设 MOCI_WASM_FEATURES_MASK env var (hex 32-bit)
++// FromContext 返回前按 mask bit i 调用 Remove(WasmEnabledFeature(i))
++// 关掉特定 flagged experimental features 跨 env 不同
++// always-enabled features (SIMD/GC/threads/memory64 等) 因 Module 缓存一致性约束不动
++// fail-safe: env var 没设 / mask=0 → 返原 features 集合
++static uint32_t moci_get_wasm_features_mask() {
++  static uint32_t s_mask = UINT32_MAX;
++  if (s_mask != UINT32_MAX) return s_mask;
++  const char* env = std::getenv("MOCI_WASM_FEATURES_MASK");
++  s_mask = (env && *env) ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0;
++  return s_mask;
++}
++}  // namespace
++
+ // static
+ WasmEnabledFeatures WasmEnabledFeatures::FromFlags() {
+   WasmEnabledFeatures features = WasmEnabledFeatures::None();
+@@ -29,6 +47,18 @@ WasmEnabledFeatures WasmEnabledFeatures::FromFlags() {
+     features.Add(WasmEnabledFeature::feat);
+   FOREACH_WASM_FEATURE_FLAG(CHECK_FEATURE_FLAG)
+ #undef CHECK_FEATURE_FLAG
++
++  // [MoCi v.216 WASM features mask] 在 FromFlags 加 mask，确保 FromIsolate /
++  // FromContext / 直接调 FromFlags() 三入口全覆盖
++  uint32_t mask = moci_get_wasm_features_mask();
++  if (mask) {
++#define MOCI_REMOVE_IF_MASKED(feat, ...)                                       \
++  if (mask & (1u << static_cast<unsigned>(WasmEnabledFeature::feat)))          \
++    features.Remove(WasmEnabledFeature::feat);
++    FOREACH_WASM_FEATURE_FLAG(MOCI_REMOVE_IF_MASKED)
++#undef MOCI_REMOVE_IF_MASKED
++  }
++
+   return features;
+ }
+ 
+@@ -48,6 +78,17 @@ WasmEnabledFeatures WasmEnabledFeatures::FromContext(
+   }
+ 
+   // This space intentionally left blank for future Wasm origin trials.
++
++  // [MoCi v.216 WASM features mask] 按 envId 派生 mask 关掉特定 flagged features
++  uint32_t mask = moci_get_wasm_features_mask();
++  if (mask) {
++#define MOCI_REMOVE_IF_MASKED(feat, ...)                                       \
++  if (mask & (1u << static_cast<unsigned>(WasmEnabledFeature::feat)))          \
++    features.Remove(WasmEnabledFeature::feat);
++    FOREACH_WASM_FEATURE_FLAG(MOCI_REMOVE_IF_MASKED)
++#undef MOCI_REMOVE_IF_MASKED
++  }
++
+   return features;
+ }
+ 

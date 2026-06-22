@@ -1,0 +1,32 @@
+diff --git a/components/omnibox/browser/location_bar_model_impl.cc b/components/omnibox/browser/location_bar_model_impl.cc
+index 37f8f0fba1..87603acae6 100644
+--- a/components/omnibox/browser/location_bar_model_impl.cc
++++ b/components/omnibox/browser/location_bar_model_impl.cc
+@@ -7,6 +7,7 @@
+ #include <string>
+ 
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/feature_list.h"
+ #include "base/metrics/field_trial_params.h"
+ #include "base/notreached.h"
+@@ -112,6 +113,19 @@ std::u16string LocationBarModelImpl::GetFormattedURL(
+   if (!ShouldDisplayURL())
+     return std::u16string{};
+ 
++  // [MoCi newtab-blank-omnibox] MoCi env 的新标签页 home.moci 是内部起始页（等价 NTP），
++  // 地址栏留空（跟真 Chrome 新标签页一致），不显示 https://home.moci。
++  // components/ 层不能依赖 chrome/，用 raw switch 名 "moci-locked-extensions"（=MoCi env）做 gate。
++  // 不影响其它任何 URL；非 MoCi 二进制 switch 缺席走原逻辑。
++  {
++    GURL moci_url(GetURL());
++    if (moci_url.host() == "home.moci" &&
++        base::CommandLine::ForCurrentProcess()->HasSwitch(
++            "moci-locked-extensions")) {
++      return std::u16string{};
++    }
++  }
++
+   // Reset |format_types| to prevent elision of URLs when relevant extension or
+   // pref is enabled.
+   if (delegate_->ShouldPreventElision()) {

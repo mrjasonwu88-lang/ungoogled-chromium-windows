@@ -1,0 +1,879 @@
+
+diff --git a/components/moci/BUILD.gn b/components/moci/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/components/moci/BUILD.gn
+@@ -0,0 +1,20 @@
++# Copyright 2026 Anhui MoCi Information Technology Co., Ltd.
++# SPDX-License-Identifier: MIT
++#
++# MoCi fingerprint config: loaded from --fingerprint-config JSON in each
++# process during PreSandboxStartup, read by farbling patches across blink
++# renderer / net / components / chrome. Lives in //components so all layers
++# can deps it (vs original location //chrome/common which blink can't see).
++
++component("fingerprint_config") {
++  sources = [
++    "fingerprint_config.h",
++    "fingerprint_config.cc",
++    "fingerprint_helpers.h",
++    "fingerprint_helpers.cc",
++  ]
++
++  defines = [ "IS_MOCI_FINGERPRINT_CONFIG_IMPL" ]
++
++  deps = [ "//base" ]
++}
+diff --git a/components/moci/fingerprint_config.cc b/components/moci/fingerprint_config.cc
+new file mode 100644
+--- /dev/null
++++ b/components/moci/fingerprint_config.cc
+@@ -0,0 +1,89 @@
++// Copyright 2026 安徽魔词信息科技有限公司 (Kuajing168 / MoCi)
++// SPDX-License-Identifier: MIT
++
++#include "components/moci/fingerprint_config.h"
++
++#include <utility>
++
++#include "base/check.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++
++namespace moci {
++
++namespace {
++
++// Soft cap on JSON file size. The schema is ~166 fields total. A typical
++// serialized config is 8-20 KB. 1 MB is generous; reject anything larger as
++// probably malformed / malicious.
++constexpr size_t kMaxConfigBytes = 1024 * 1024;
++
++}  // namespace
++
++// static
++MoCiFingerprintConfig& MoCiFingerprintConfig::Get() {
++  static base::NoDestructor<MoCiFingerprintConfig> instance;
++  return *instance;
++}
++
++// static
++void MoCiFingerprintConfig::Init(const base::FilePath& json_path) {
++  MoCiFingerprintConfig& self = Get();
++  if (self.init_called_) {
++    LOG(WARNING) << "[MoCi] MoCiFingerprintConfig::Init called twice; "
++                    "ignoring second call. Path=" << json_path.value();
++    return;
++  }
++  self.init_called_ = true;
++
++  if (json_path.empty()) {
++    LOG(INFO) << "[MoCi] no --fingerprint-config provided; farbling disabled";
++    return;
++  }
++
++  std::string contents;
++  if (!base::ReadFileToStringWithMaxSize(json_path, &contents,
++                                         kMaxConfigBytes)) {
++    LOG(ERROR) << "[MoCi] failed to read fingerprint-config from "
++               << json_path.value() << " (missing or >1MB)";
++    return;
++  }
++
++  auto parsed = base::JSONReader::ReadAndReturnValueWithError(
++      contents, base::JSON_PARSE_RFC);
++  if (!parsed.has_value()) {
++    LOG(ERROR) << "[MoCi] JSON parse error in fingerprint-config: "
++               << parsed.error().message << " (line " << parsed.error().line
++               << ", col " << parsed.error().column << ")";
++    return;
++  }
++
++  if (!parsed->is_dict()) {
++    LOG(ERROR) << "[MoCi] fingerprint-config root must be an object, got "
++               << parsed->type();
++    return;
++  }
++
++  self.root_ = std::move(*parsed).TakeDict();
++  self.loaded_ = true;
++  LOG(INFO) << "[MoCi] loaded fingerprint-config from " << json_path.value()
++          << " (" << self.root_.size() << " top-level keys)";
++}
++
++void MoCiFingerprintConfig::LogStatus() const {
++  if (loaded_) {
++    LOG(INFO) << "[MoCi] fingerprint-config active; " << root_.size()
++              << " top-level keys";
++  } else if (init_called_) {
++    LOG(INFO) << "[MoCi] fingerprint-config not loaded (no switch / missing "
++                 "file / parse error); farbling disabled";
++  } else {
++    LOG(WARNING) << "[MoCi] LogStatus called before Init";
++  }
++}
++
++MoCiFingerprintConfig::MoCiFingerprintConfig() = default;
++
++}  // namespace moci
+diff --git a/components/moci/fingerprint_config.h b/components/moci/fingerprint_config.h
+new file mode 100644
+--- /dev/null
++++ b/components/moci/fingerprint_config.h
+@@ -0,0 +1,82 @@
++// Copyright 2026 安徽魔词信息科技有限公司 (Kuajing168 / MoCi)
++// SPDX-License-Identifier: MIT
++//
++// MoCi fingerprint configuration singleton.
++//
++// Loaded once per process during PreSandboxStartup from the path given by
++// the --fingerprint-config command line switch (see chrome_switches.h).
++// Subsequent fingerprint farbling patches (Canvas/Audio/WebGL/Font/TLS/...)
++// read configuration via MoCiFingerprintConfig::Get().
++//
++// JSON schema:
++//   https://github.com/mrjasonwu88-lang/moci-chromium-patches/blob/main/docs/fingerprint-config-schema.json
++//
++// Per-environment isolation: each environment in the MoCi client (kuajingke)
++// gets a unique JSON file. Browser process and all child processes (renderer,
++// utility, gpu) share the same file via command line propagation.
++//
++// Thread safety: Init() is called once during process startup. After Init,
++// Get() is read-only and thread-safe.
++
++#ifndef COMPONENTS_MOCI_FINGERPRINT_CONFIG_H_
++#define COMPONENTS_MOCI_FINGERPRINT_CONFIG_H_
++
++#include <memory>
++#include <string>
++
++#include "base/component_export.h"
++#include "base/files/file_path.h"
++#include "base/values.h"
++
++namespace base {
++template <typename T> class NoDestructor;
++}  // namespace base
++
++namespace moci {
++
++class COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) MoCiFingerprintConfig {
++ public:
++  // Returns the process-wide singleton. Always non-null. If Init() was never
++  // called or the JSON file failed to load, returns a singleton with an empty
++  // dictionary (so callers can safely call GetDict() without nullptr checks).
++  static MoCiFingerprintConfig& Get();
++
++  // Initialize from a JSON file path. Called by ChromeMainDelegate in browser
++  // process; called by child process main delegates after they parse the
++  // inherited --fingerprint-config switch. Idempotent: subsequent calls log a
++  // warning and become no-ops.
++  static void Init(const base::FilePath& json_path);
++
++  // Returns the root JSON object as a Dict. Empty Dict if Init() was never
++  // called or the file failed to parse. Never returns nullptr-equivalent.
++  // Callers may safely chain .FindDict("canvas")->FindInt("noiseSeed") etc.
++  const base::DictValue& GetDict() const { return root_; }
++
++  // True if Init() loaded a valid JSON file. False if no --fingerprint-config
++  // was passed, the file was missing, or JSON parse failed. Callers that need
++  // to skip farbling when no config is provided should check this first.
++  bool is_loaded() const { return loaded_; }
++
++  // Log the current load status to stderr. Should be called AFTER InitLogging()
++  // because Init() runs in PreSandboxStartup before the logger is wired up on
++  // Windows — any LOG() emitted during Init() is silently dropped. Call this
++  // from ChromeMainDelegate::SandboxInitialized to surface load state in logs.
++  void LogStatus() const;
++
++  MoCiFingerprintConfig(const MoCiFingerprintConfig&) = delete;
++  MoCiFingerprintConfig& operator=(const MoCiFingerprintConfig&) = delete;
++
++ private:
++  friend class base::NoDestructor<MoCiFingerprintConfig>;
++
++  MoCiFingerprintConfig();
++  ~MoCiFingerprintConfig() = default;
++
++  base::DictValue root_;
++  bool loaded_ = false;
++  bool init_called_ = false;
++};
++
++}  // namespace moci
++
++#endif  // COMPONENTS_MOCI_FINGERPRINT_CONFIG_H_
+diff --git a/components/moci/fingerprint_helpers.cc b/components/moci/fingerprint_helpers.cc
+new file mode 100644
+--- /dev/null
++++ b/components/moci/fingerprint_helpers.cc
+@@ -0,0 +1,487 @@
++// Copyright 2026 Anhui MoCi Information Technology Co., Ltd.
++// SPDX-License-Identifier: MIT
++
++#include "components/moci/fingerprint_helpers.h"
++
++#include <cmath>
++#include <cstring>
++
++#include "components/moci/fingerprint_config.h"
++
++namespace moci {
++
++namespace {
++
++// Helper：从 root_ 找 top-level dict（如 "webgpu" / "permissions"）
++const base::DictValue* TopDict(const std::string& key) {
++  return MoCiFingerprintConfig::Get().GetDict().FindDict(key);
++}
++
++// Helper：在 top-level dict 找 string；未命中返默认
++std::string GetTopString(const std::string& top, const std::string& field,
++                         const std::string& default_value = "") {
++  const auto* d = TopDict(top);
++  if (!d) return default_value;
++  const auto* s = d->FindString(field);
++  return s ? *s : default_value;
++}
++
++}  // namespace
++
++// ============================================================
++// Phase 3-A A-1: WebGPU
++// ============================================================
++bool ShouldOverrideWebGPU() {
++  const auto* d = TopDict("webgpu");
++  if (!d) return true;  // 默认 privacy
++  const auto* mode = d->FindString("mode");
++  return !mode || *mode == "privacy";
++}
++
++bool ShouldDisableWebGPU() {
++  const auto* d = TopDict("webgpu");
++  if (!d) return false;
++  const auto* mode = d->FindString("mode");
++  return mode && *mode == "disabled";
++}
++
++std::string GetWebGPUAdapterVendor() {
++  const auto* d = TopDict("webgpu");
++  if (!d) return "intel";
++  const auto* a = d->FindDict("adapter");
++  if (!a) return "intel";
++  const auto* v = a->FindString("vendor");
++  return v && !v->empty() ? *v : std::string("intel");
++}
++
++std::string GetWebGPUAdapterArchitecture() {
++  const auto* d = TopDict("webgpu");
++  if (!d) return "xe-lp";
++  const auto* a = d->FindDict("adapter");
++  if (!a) return "xe-lp";
++  const auto* v = a->FindString("architecture");
++  return v && !v->empty() ? *v : std::string("xe-lp");
++}
++
++std::string GetWebGPUAdapterDevice() {
++  const auto* d = TopDict("webgpu");
++  if (!d) return "0x46a6";
++  const auto* a = d->FindDict("adapter");
++  if (!a) return "0x46a6";
++  const auto* v = a->FindString("device");
++  return v && !v->empty() ? *v : std::string("0x46a6");
++}
++
++std::string GetWebGPUAdapterDescription() {
++  const auto* d = TopDict("webgpu");
++  if (!d) return "Intel(R) Iris(R) Xe Graphics";
++  const auto* a = d->FindDict("adapter");
++  if (!a) return "Intel(R) Iris(R) Xe Graphics";
++  const auto* v = a->FindString("description");
++  return v && !v->empty() ? *v : std::string("Intel(R) Iris(R) Xe Graphics");
++}
++
++std::vector<std::string> GetWebGPUFeatures() {
++  std::vector<std::string> result;
++  const auto* d = TopDict("webgpu");
++  if (!d) return result;
++  const auto* list = d->FindList("features");
++  if (!list) return result;
++  for (const auto& v : *list) {
++    if (v.is_string()) result.push_back(v.GetString());
++  }
++  return result;
++}
++
++uint64_t GetWebGPULimit(const std::string& key) {
++  const auto* d = TopDict("webgpu");
++  if (!d) return 0;
++  const auto* limits = d->FindDict("limits");
++  if (!limits) return 0;
++  // limits 数值可能超 int32 (e.g. maxBufferSize 4GB)，base::Value JSON int 实际是 int64
++  if (auto v = limits->FindInt(key)) return static_cast<uint64_t>(*v);
++  if (auto v = limits->FindDouble(key)) return static_cast<uint64_t>(*v);
++  return 0;
++}
++
++// ============================================================
++// Phase 3-A A-3: Speech voices
++// ============================================================
++bool ShouldOverrideWebSpeechVoices() {
++  const auto* d = TopDict("speechVoices");
++  if (!d) return true;
++  const auto* mode = d->FindString("mode");
++  return !mode || *mode == "privacy";
++}
++
++bool ShouldDisableWebSpeechVoices() {
++  const auto* d = TopDict("speechVoices");
++  if (!d) return false;
++  const auto* mode = d->FindString("mode");
++  return mode && *mode == "disabled";
++}
++
++std::vector<SpeechVoice> GetWebSpeechVoices() {
++  std::vector<SpeechVoice> result;
++  const auto* d = TopDict("speechVoices");
++  if (!d) return result;
++  const auto* list = d->FindList("voices");
++  if (!list) return result;
++  for (const auto& v : *list) {
++    if (!v.is_dict()) continue;
++    const auto& vd = v.GetDict();
++    SpeechVoice entry;
++    if (const auto* n = vd.FindString("name")) entry.name = *n;
++    if (const auto* l = vd.FindString("lang")) entry.lang = *l;
++    if (const auto* u = vd.FindString("voiceURI")) entry.voice_uri = *u;
++    if (auto ls = vd.FindBool("localService")) entry.local_service = *ls;
++    if (auto df = vd.FindBool("default")) entry.default_voice = *df;
++    if (entry.voice_uri.empty()) entry.voice_uri = entry.name;
++    result.push_back(std::move(entry));
++  }
++  return result;
++}
++
++// ============================================================
++// Phase 3-A A-4: Permissions
++// ============================================================
++bool ShouldOverrideWebPermissions() {
++  const auto* d = TopDict("permissions");
++  if (!d) return true;
++  const auto* mode = d->FindString("mode");
++  return !mode || *mode == "privacy";
++}
++
++std::string GetWebPermissionState(const std::string& name) {
++  const auto* d = TopDict("permissions");
++  if (!d) return "";
++  const auto* profile = d->FindDict("profile");
++  if (!profile) return "";
++  const auto* s = profile->FindString(name);
++  return s ? *s : std::string();
++}
++
++// ============================================================
++// Phase 3-A A-5: Math noise
++// ============================================================
++bool ShouldApplyMathNoise() {
++  const auto* d = TopDict("math");
++  if (!d) return true;
++  const auto* mode = d->FindString("mode");
++  return !mode || *mode == "privacy";
++}
++
++uint32_t GetMathNoiseSeed() {
++  const auto* d = TopDict("math");
++  if (!d) return 0;
++  if (auto v = d->FindInt("noiseSeed")) return static_cast<uint32_t>(*v);
++  if (auto v = d->FindDouble("noiseSeed")) return static_cast<uint32_t>(*v);
++  return 0;
++}
++
++// v.215 V8 Math hook implementation
++// 算法：把 (bits XOR seed XOR fn_name_hash) 通过 splitmix64 mix → 取 2 bit XOR 进 mantissa LSB
++// 数值精度损失 ~10^-15 = IEEE 754 mantissa last 2 bit (无 perceptible 影响)
++// 但 String(Math.acos(0.123)).slice(-12) 末位字符跨 env 不同 → SW-12 detector / CreepJS
++// Math hash 跨 env 不同。fail-safe: ShouldApplyMathNoise()=false / NaN / Inf → 返原值。
++double ApplyMathNoise(double value, const char* fn_name) {
++  if (!ShouldApplyMathNoise()) return value;
++  if (!std::isfinite(value) || value == 0.0) return value;
++  uint32_t seed = GetMathNoiseSeed();
++  if (seed == 0) return value;
++  // fn_name fnv1a hash 让每个函数 noise pattern 独立
++  uint32_t fn_hash = 0x811c9dc5u;
++  for (const char* p = fn_name; *p; ++p) {
++    fn_hash ^= static_cast<uint8_t>(*p);
++    fn_hash *= 0x01000193u;
++  }
++  uint64_t bits;
++  static_assert(sizeof(bits) == sizeof(value), "double != 64 bit");
++  std::memcpy(&bits, &value, sizeof(bits));
++  // splitmix64 hash bits ^ seed ^ fn_hash
++  uint64_t h = bits ^ static_cast<uint64_t>(seed) ^ (static_cast<uint64_t>(fn_hash) << 32);
++  h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
++  h ^= h >> 31;
++  // 取末 2 bit XOR mantissa LSB
++  uint64_t noise = h & 0x3ULL;
++  bits ^= noise;
++  std::memcpy(&value, &bits, sizeof(bits));
++  return value;
++}
++
++// ============================================================
++// Phase 5 #2: WebAssembly features mask (v.216)
++// ============================================================
++uint32_t GetWasmFeaturesMask() {
++  const auto* d = TopDict("wasm");
++  if (!d) return 0;
++  if (auto v = d->FindInt("featuresMask")) return static_cast<uint32_t>(*v);
++  if (auto v = d->FindDouble("featuresMask")) return static_cast<uint32_t>(*v);
++  return 0;
++}
++
++// ============================================================
++// Phase 3-A A-2: MediaCapabilities
++// ============================================================
++bool ShouldOverrideMediaCapabilities() {
++  const auto* d = TopDict("media");
++  if (!d) return true;
++  const auto* mode = d->FindString("mode");
++  return !mode || *mode == "privacy";
++}
++
++MediaCapability GetMediaCapability(const std::string& mime) {
++  MediaCapability cap;
++  const auto* d = TopDict("media");
++  if (!d) return cap;
++  const auto* caps = d->FindDict("capabilities");
++  if (!caps) return cap;
++  const auto* entry = caps->FindDict(mime);
++  if (!entry) return cap;
++  if (auto v = entry->FindBool("smooth")) cap.smooth = *v;
++  if (auto v = entry->FindBool("powerEfficient")) cap.power_efficient = *v;
++  if (auto v = entry->FindBool("supported")) cap.supported = *v;
++  return cap;
++}
++
++// ============================================================
++// Phase 3-A A-6: EME
++// ============================================================
++bool ShouldOverrideWebEME() {
++  const auto* d = TopDict("eme");
++  if (!d) return true;
++  const auto* mode = d->FindString("mode");
++  return !mode || *mode == "privacy";
++}
++
++std::string GetWebEMEClientToken() {
++  return GetTopString("eme", "clientToken", "");
++}
++
++std::string GetWebEMEDistinctiveIdentifier() {
++  return GetTopString("eme", "distinctiveIdentifier", "not-allowed");
++}
++
++std::string GetWebEMEPersistentState() {
++  return GetTopString("eme", "persistentState", "optional");
++}
++
++std::string GetWebEMERobustness() {
++  return GetTopString("eme", "robustness", "SW_SECURE_DECODE");
++}
++
++// ============================================================
++// Phase 3-B B-2: Accept-Language
++// ============================================================
++bool ShouldOverrideAcceptLanguage() {
++  const auto* s = MoCiFingerprintConfig::Get().GetDict().FindString("acceptLanguage");
++  return s && !s->empty();
++}
++
++std::string GetSpoofedAcceptLanguage() {
++  const auto* s = MoCiFingerprintConfig::Get().GetDict().FindString("acceptLanguage");
++  return s ? *s : std::string();
++}
++
++// ============================================================
++// Phase 3-B B-3: MediaDevices
++// ============================================================
++bool ShouldOverrideMediaDevices() {
++  const auto* d = TopDict("mediaDevices");
++  if (!d) return false;
++  // KYC 透传时不覆盖
++  if (auto pt = d->FindBool("passthrough"); pt && *pt) return false;
++  // 有 devices 列表时覆盖
++  const auto* list = d->FindList("devices");
++  return list && !list->empty();
++}
++
++std::vector<MediaDeviceInfoEntry> GetSpoofedMediaDevices() {
++  std::vector<MediaDeviceInfoEntry> result;
++  const auto* d = TopDict("mediaDevices");
++  if (!d) return result;
++  const auto* list = d->FindList("devices");
++  if (!list) return result;
++  for (const auto& v : *list) {
++    if (!v.is_dict()) continue;
++    const auto& vd = v.GetDict();
++    MediaDeviceInfoEntry entry;
++    if (const auto* id = vd.FindString("deviceId")) entry.device_id = *id;
++    if (const auto* g = vd.FindString("groupId")) entry.group_id = *g;
++    if (const auto* k = vd.FindString("kind")) entry.kind = *k;
++    if (const auto* l = vd.FindString("label")) entry.label = *l;
++    result.push_back(std::move(entry));
++  }
++  return result;
++}
++
++// ============================================================
++// Phase 3-B B-4: Sensors
++// ============================================================
++bool IsSensorDeviceMotionEnabled() {
++  const auto* d = TopDict("sensors");
++  if (!d) return false;
++  if (auto v = d->FindBool("deviceMotionEnabled")) return *v;
++  return false;
++}
++
++bool IsSensorDeviceOrientationEnabled() {
++  const auto* d = TopDict("sensors");
++  if (!d) return false;
++  if (auto v = d->FindBool("deviceOrientationEnabled")) return *v;
++  return false;
++}
++
++bool IsSensorAmbientLightEnabled() {
++  const auto* d = TopDict("sensors");
++  if (!d) return false;
++  if (auto v = d->FindBool("ambientLightEnabled")) return *v;
++  return false;
++}
++
++// ============================================================
++// Phase 3-B B-5: WebAuthn
++// ============================================================
++bool IsWebAuthnPlatformAuthenticatorAvailable() {
++  const auto* d = TopDict("webauthn");
++  if (!d) return true;
++  if (auto v = d->FindBool("platformAuthenticatorAvailable")) return *v;
++  return true;
++}
++
++bool IsWebAuthnConditionalMediationAvailable() {
++  const auto* d = TopDict("webauthn");
++  if (!d) return true;
++  if (auto v = d->FindBool("conditionalMediationAvailable")) return *v;
++  return true;
++}
++
++// ============================================================
++// Phase 3-B B-6: Performance memory
++// ============================================================
++uint64_t GetSpoofedPerformanceMemoryLimit() {
++  const auto* d = TopDict("performanceMemory");
++  if (!d) return 4294705152ULL;  // 默认 ~4GB
++  if (auto v = d->FindInt("jsHeapSizeLimit")) return static_cast<uint64_t>(*v);
++  if (auto v = d->FindDouble("jsHeapSizeLimit")) return static_cast<uint64_t>(*v);
++  return 4294705152ULL;
++}
++
++// ============================================================
++// Phase 3-B B-8: HTTP header order
++// ============================================================
++bool ShouldOverrideHTTPHeaderOrder() {
++  const auto* d = TopDict("httpHeaderOrder");
++  if (!d) return false;
++  const auto* order = d->FindList("order");
++  return order && !order->empty();
++}
++
++std::vector<std::string> GetHTTPHeaderOrder() {
++  std::vector<std::string> result;
++  const auto* d = TopDict("httpHeaderOrder");
++  if (!d) return result;
++  const auto* order = d->FindList("order");
++  if (!order) return result;
++  for (const auto& v : *order) {
++    if (v.is_string()) result.push_back(v.GetString());
++  }
++  return result;
++}
++
++// ============================================================
++// Phase 3-C C-8: matchMedia prefers-*
++// ============================================================
++std::string GetPrefersColorScheme() {
++  return GetTopString("prefers", "colorScheme", "light");
++}
++
++std::string GetPrefersReducedMotion() {
++  return GetTopString("prefers", "reducedMotion", "no-preference");
++}
++
++std::string GetPrefersContrast() {
++  return GetTopString("prefers", "contrast", "no-preference");
++}
++
++// ============================================================
++// v.213 SW-12: Fonts allowlist enforcement
++// ============================================================
++// kernel-manager.ts 把 fonts 直接写成纯 array（["Arial","Helvetica",...]）
++// 不是 { mode: "...", list: [...] }。两种 format 都兼容。
++bool ShouldFilterFonts() {
++  const auto& root = MoCiFingerprintConfig::Get().GetDict();
++  // format 1: 纯 array
++  const auto* arr = root.FindList("fonts");
++  if (arr && !arr->empty()) return true;
++  // format 2: dict { mode, list }
++  const auto* d = root.FindDict("fonts");
++  if (!d) return false;
++  const auto* mode = d->FindString("mode");
++  if (mode && *mode == "real") return false;
++  const auto* list = d->FindList("list");
++  return list && !list->empty();
++}
++
++std::vector<std::string> GetAllowedFonts() {
++  std::vector<std::string> out;
++  const auto& root = MoCiFingerprintConfig::Get().GetDict();
++  // format 1: 纯 array
++  const auto* arr = root.FindList("fonts");
++  if (arr) {
++    for (const auto& v : *arr) {
++      if (v.is_string()) out.push_back(v.GetString());
++    }
++    return out;
++  }
++  // format 2: { list }
++  const auto* d = root.FindDict("fonts");
++  if (!d) return out;
++  const auto* list = d->FindList("list");
++  if (!list) return out;
++  for (const auto& v : *list) {
++    if (v.is_string()) out.push_back(v.GetString());
++  }
++  return out;
++}
++
++bool IsFontAllowed(const std::string& font_family) {
++  if (!ShouldFilterFonts()) return true;
++  if (font_family.empty()) return true;
++
++  // BrowserLeaks / fingerprint 检测站通常用 width measurement 测这些字体：
++  // 把不在 allowlist 的拦掉让 fallback 到 monospace；其它 family 全放过（避免
++  // 破坏 chromium 内部 fallback chain / 系统替换字体 / 用户 CSS 渲染）。
++  static const char* kFingerprintTestFonts[] = {
++    "arial", "helvetica", "times new roman", "georgia",
++    "verdana", "courier new", "comic sans ms", "tahoma",
++    "trebuchet ms", "impact", "lucida sans unicode", "palatino linotype",
++    "garamond", "book antiqua", "calibri", "cambria",
++    "consolas", "candara", "constantia", "corbel",
++    "courier", "geneva", "ms gothic", "ms pgothic",
++  };
++  std::string lower;
++  lower.reserve(font_family.size());
++  for (char c : font_family) {
++    if (c == '"' || c == '\'') continue;
++    lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
++  }
++  // 只对 "fingerprint test font" 子集 enforce allowlist；其它任由 chromium
++  bool is_test_font = false;
++  for (const char* tf : kFingerprintTestFonts) {
++    if (lower == tf) { is_test_font = true; break; }
++  }
++  if (!is_test_font) return true;
++
++  const auto allowed = GetAllowedFonts();
++  for (const auto& a : allowed) {
++    std::string al;
++    al.reserve(a.size());
++    for (char c : a) al.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
++    if (lower == al) return true;
++  }
++  return false;
++}
++
++}  // namespace moci
+diff --git a/components/moci/fingerprint_helpers.h b/components/moci/fingerprint_helpers.h
+new file mode 100644
+--- /dev/null
++++ b/components/moci/fingerprint_helpers.h
+@@ -0,0 +1,175 @@
++// Copyright 2026 Anhui MoCi Information Technology Co., Ltd.
++// SPDX-License-Identifier: MIT
++//
++// Phase 3 fingerprint helpers — typed accessors over MoCiFingerprintConfig::Get().GetDict()
++//
++// All helpers are read-only and thread-safe after MoCiFingerprintConfig::Init().
++// Each helper does its own dict lookup; no caching (caller can wrap if hot path).
++// Default values match "fingerprint not configured" = safe privacy mode.
++//
++// Phase 3-A (必做缺口):  A-1 WebGPU / A-3 Voices / A-4 Permissions / A-5 Math /
++//                       A-2 MediaCapabilities / A-6 EME-Widevine
++// Phase 3-B (应做项):    B-2 Accept-Language / B-3 mediaDevices / B-4 Sensors /
++//                       B-5 WebAuthn / B-6 Memory / B-8 HTTP Header Order
++// Phase 3-C (可选):      C-8 matchMedia prefers-*
++
++#ifndef COMPONENTS_MOCI_FINGERPRINT_HELPERS_H_
++#define COMPONENTS_MOCI_FINGERPRINT_HELPERS_H_
++
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/component_export.h"
++
++namespace moci {
++
++// ============================================================
++// Phase 3-A A-1: WebGPU adapter spoofing
++// ============================================================
++// mode = "privacy" → 用 helpers 覆盖 adapter.info / limits / features
++// mode = "real"    → 走 chromium 原生
++// mode = "disabled"→ navigator.gpu 返 null
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideWebGPU();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldDisableWebGPU();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebGPUAdapterVendor();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebGPUAdapterArchitecture();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebGPUAdapterDevice();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebGPUAdapterDescription();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::vector<std::string> GetWebGPUFeatures();
++// limits 查询；未配置返 0（调用方 fallback chromium 默认）
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) uint64_t GetWebGPULimit(const std::string& key);
++
++// ============================================================
++// Phase 3-A A-3: Speech Synthesis voices
++// ============================================================
++struct COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) SpeechVoice {
++  std::string name;
++  std::string lang;
++  std::string voice_uri;
++  bool local_service = true;
++  bool default_voice = false;
++};
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideWebSpeechVoices();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldDisableWebSpeechVoices();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::vector<SpeechVoice> GetWebSpeechVoices();
++
++// ============================================================
++// Phase 3-A A-4: Permissions API matrix
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideWebPermissions();
++// permission_name → state ("prompt"/"granted"/"denied")；未命中返 ""
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG)
++std::string GetWebPermissionState(const std::string& name);
++
++// ============================================================
++// Phase 3-A A-5: Math floating-point noise
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldApplyMathNoise();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) uint32_t GetMathNoiseSeed();
++
++// v.215 V8 Math hook implementation - called from v8/base/ieee754.cc::moci_noise
++// for each transcendental result. Returns input with 1-2 bit mantissa LSB noise
++// per (value, seed, fn_name) → 跨 env Math hash 不同 → 真实风控站 (CreepJS/BrowserScan)
++// 也看到 Math 末位跨 env 不同。fail-safe: 没 config / seed=0 → 返原值不动。
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG)
++double ApplyMathNoise(double value, const char* fn_name);
++
++// ============================================================
++// Phase 5 #2: WebAssembly features mask (v.216)
++// ============================================================
++// 读 --fingerprint-config 里 wasm.featuresMask 字段（32-bit hex mask）
++// chrome PreSandboxStartup 时调用一次把值 setenv 进 MOCI_WASM_FEATURES_MASK
++// V8 wasm 层 (v8/src/wasm/wasm-features.cc) 读 env var → 按 bit i 关掉 flagged feature i
++// fail-safe: 没 config / mask=0 → 返 0 即不动 features
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) uint32_t GetWasmFeaturesMask();
++
++// ============================================================
++// Phase 3-A A-2: MediaCapabilities
++// ============================================================
++struct COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) MediaCapability {
++  bool smooth = false;
++  bool power_efficient = false;
++  bool supported = true;
++};
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideMediaCapabilities();
++// mime ("video/mp4; codecs=...") → capability；未命中返 default {false,false,true}
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG)
++MediaCapability GetMediaCapability(const std::string& mime);
++
++// ============================================================
++// Phase 3-A A-6: EME / Widevine CDM
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideWebEME();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebEMEClientToken();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebEMEDistinctiveIdentifier();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebEMEPersistentState();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetWebEMERobustness();
++
++// ============================================================
++// Phase 3-B B-2: Accept-Language HTTP header
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideAcceptLanguage();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetSpoofedAcceptLanguage();
++
++// ============================================================
++// Phase 3-B B-3: MediaDevices.enumerateDevices
++// ============================================================
++struct COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) MediaDeviceInfoEntry {
++  std::string device_id;
++  std::string group_id;
++  std::string kind;   // "audioinput" / "audiooutput" / "videoinput"
++  std::string label;
++};
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideMediaDevices();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG)
++std::vector<MediaDeviceInfoEntry> GetSpoofedMediaDevices();
++
++// ============================================================
++// Phase 3-B B-4: Sensor APIs
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsSensorDeviceMotionEnabled();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsSensorDeviceOrientationEnabled();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsSensorAmbientLightEnabled();
++
++// ============================================================
++// Phase 3-B B-5: WebAuthn platform authenticator
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsWebAuthnPlatformAuthenticatorAvailable();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsWebAuthnConditionalMediationAvailable();
++
++// ============================================================
++// Phase 3-B B-6: Performance.memory.jsHeapSizeLimit
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) uint64_t GetSpoofedPerformanceMemoryLimit();
++
++// ============================================================
++// Phase 3-B B-8: HTTP request header order
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldOverrideHTTPHeaderOrder();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::vector<std::string> GetHTTPHeaderOrder();
++
++// ============================================================
++// Phase 3-C C-8: matchMedia prefers-*
++// ============================================================
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetPrefersColorScheme();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetPrefersReducedMotion();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::string GetPrefersContrast();
++
++// ============================================================
++// v.213 SW-12: Fonts allowlist enforcement
++// ============================================================
++// config.fonts 配的 16 字体应该作为白名单，font_cache 暴露给 navigator.fonts /
++// FontFaceSetDocument.check / FontDescription resolve 时只让 allowlist 内的过。
++// 解决 v.212 之前 chrome 实测含 Georgia / Comic Sans MS 等 config 外字体的 SW-12 fail。
++// mode = "noise"(默认): 启用白名单 + font metric noise
++// mode = "real":         不过滤（暴露真实宿主字体集 — 仅 debug）
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool ShouldFilterFonts();
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) std::vector<std::string> GetAllowedFonts();
++// case-insensitive lookup；未 ShouldFilterFonts 时返 true（不过滤）
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsFontAllowed(const std::string& font_family);
++
++}  // namespace moci
++
++#endif  // COMPONENTS_MOCI_FINGERPRINT_HELPERS_H_

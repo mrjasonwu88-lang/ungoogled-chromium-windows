@@ -1,0 +1,74 @@
+[MoCi v.213 SW-12] Fonts allowlist enforcement — IsFontAllowed in font_cache
+
+桌面 chromium 默认会响应 system 所有字体，被 fingerprinter 用 measureText/offsetWidth
+枚举可用字体生成 sub-pixel hash。本 patch 把 font lookup 包装一层 allowlist gate:
+
+  - third_party/blink/renderer/platform/BUILD.gn  — //components/moci:fingerprint_config 加 deps
+  - third_party/blink/renderer/platform/fonts/font_cache.cc — IsFontAllowed gate +
+    moci::ShouldFilterFonts + moci::IsFontInAllowedSet 实现
+
+跟 moci-fp-fonts-farbling-noise.patch 不同点：
+  - farbling-noise 是 offsetWidth/measureText 在 element 层做 0.0015 量级 noise
+  - 本 patch 是 allowlist enforcement，所有 not-in-allowlist 字体 substitute 为默认字体
+  - 两者 layered defense
+
+diff --git a/third_party/blink/renderer/platform/BUILD.gn b/third_party/blink/renderer/platform/BUILD.gn
+index 87f64f5c2c..771f58f872 100644
+--- a/third_party/blink/renderer/platform/BUILD.gn
++++ b/third_party/blink/renderer/platform/BUILD.gn
+@@ -1760,7 +1760,9 @@ component("platform") {
+     "//third_party/blink/renderer:non_test_config",
+   ]
+ 
+-  include_dirs = []
++  include_dirs = [
++    "//third_party/skia/include/private", # For shuffler in graphics/static_bitmap_image.cc
++  ]
+ 
+   allow_circular_includes_from = [
+     "//third_party/blink/renderer/platform/blob",
+@@ -1815,9 +1817,12 @@ component("platform") {
+     "//components/language_detection/content/common:common_blink",
+     "//components/language_detection/content/renderer",
+     "//components/language_detection/core",
++    # [MoCi v.213 SW-12] fonts allowlist — IsFontAllowed in font_cache.cc
++    "//components/moci:fingerprint_config",
+     "//components/paint_preview/common",
+     "//components/search_engines:search_engine_utils",
+     "//components/translate/core/language_detection",
++    "//components/ungoogled:ungoogled_switches",
+     "//components/viz/client",
+     "//components/viz/common",
+     "//components/webrtc:net_address_utils",
+diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
+index 75cc0b764f..abac865f89 100644
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -32,6 +32,9 @@
+ #include <limits>
+ #include <memory>
+ 
++// [MoCi v.213 SW-12] Fonts allowlist helpers
++#include "components/moci/fingerprint_helpers.h"
++
+ #include "base/debug/alias.h"
+ #include "base/feature_list.h"
+ #include "base/notreached.h"
+@@ -153,6 +156,17 @@ const SimpleFontData* FontCache::GetFontData(
+     const FontDescription& font_description,
+     const AtomicString& family,
+     AlternateFontName altername_font_name) {
++  // [MoCi v.213 SW-12] Fonts allowlist enforcement
++  // 如 fingerprint-config 配 fonts.list 白名单 + fonts.mode != "real"，
++  // 不在白名单的 family 返 nullptr → CSS font-matching fallback chain
++  //   走下一个 family（'Georgia, monospace' → fall through 到 monospace）
++  // → SW-12 detector span.offsetWidth 跟 defaultWidth 一致 → 字体不暴露存在
++  // 副作用：用户访问 font-family: Georgia 网页 fallback 到 serif/system，视觉略变
++  //   但不会光秃（CSS generic fallback 保证）。trade-off 换 fingerprint 一致性。
++  if (!family.empty() && moci::ShouldFilterFonts() &&
++      !moci::IsFontAllowed(family.Utf8())) {
++    return nullptr;
++  }
+   if (const FontPlatformData* platform_data = GetFontPlatformData(
+           font_description,
+           FontFaceCreationParams(

@@ -1,0 +1,480 @@
+diff --git a/base/i18n/icu_util.cc b/base/i18n/icu_util.cc
+index 6e6e12089d..7230effd9f 100644
+--- a/base/i18n/icu_util.cc
++++ b/base/i18n/icu_util.cc
+@@ -15,12 +15,19 @@
+ #include <memory>
+ #include <string>
+ 
++#include <functional>
++#include <optional>
++
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/debug/alias.h"
++#include "base/files/file_path.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/environment.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/values.h"
+ #include "base/files/memory_mapped_file.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -50,14 +57,11 @@
+ #include "base/fuchsia/intl_profile_watcher.h"
+ #endif
+ 
+-#if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_FUCHSIA)
++// MoCi fp-16: unconditional ICU TimeZone + UnicodeString includes so we can
++// override default TZ in the new InitializeIcuTimeZone() prologue regardless
++// of platform.
+ #include "third_party/icu/source/common/unicode/unistr.h"
+-#endif
+-
+-#if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_FUCHSIA) || \
+-    BUILDFLAG(IS_CHROMEOS) || (BUILDFLAG(IS_LINUX) && !BUILDFLAG(IS_CASTOS))
+ #include "third_party/icu/source/i18n/unicode/timezone.h"
+-#endif
+ 
+ namespace base::i18n {
+ 
+@@ -314,6 +318,47 @@ bool InitializeICUFromDataFile() {
+ // On some platforms, the time zone must be explicitly initialized zone rather
+ // than relying on ICU's internal initialization.
+ void InitializeIcuTimeZone() {
++  // MoCi fp-16 B: 3-tier timezone spoof from --fingerprint-config.
++  // Tier 1: JSON timezone.name (user-configured in env). Tier 2: path-hash
++  // pool (per-env stable when JSON missing). Tier 3: detectHostTimeZone (no
++  // switch present). Use base::JSONReader directly here because base/i18n/
++  // cannot depend on components/moci/ (layering).
++  if (auto* cmd = base::CommandLine::ForCurrentProcess();
++      cmd && cmd->HasSwitch("fingerprint-config")) {
++    auto p = cmd->GetSwitchValuePath("fingerprint-config");
++    if (!p.empty()) {
++      // Tier 1: read timezone.name from JSON.
++      // Chromium 148: JSONReader::ReadDict signature requires options arg.
++      std::string contents;
++      if (base::ReadFileToString(p, &contents)) {
++        auto dict = base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC);
++        if (dict) {
++          if (auto* tz = dict->FindDict("timezone")) {
++            if (auto* name = tz->FindString("name");
++                name && !name->empty()) {
++              icu::TimeZone::adoptDefault(
++                  icu::TimeZone::createTimeZone(
++                      icu::UnicodeString::fromUTF8(*name)));
++              return;
++            }
++          }
++        }
++      }
++      // Tier 2: path-hash pool (fallback when JSON missing/invalid).
++      static const char* const kZones[] = {
++        "America/New_York", "America/Los_Angeles", "America/Chicago",
++        "Europe/London",    "Europe/Berlin",       "Europe/Paris",
++        "Asia/Tokyo",       "Asia/Singapore",      "Asia/Shanghai",
++        "Asia/Hong_Kong",   "Australia/Sydney",    "Pacific/Auckland",
++      };
++      auto seed = std::hash<base::FilePath::StringType>{}(p.value());
++      const char* zone_id = kZones[seed % std::size(kZones)];
++      icu::TimeZone::adoptDefault(
++          icu::TimeZone::createTimeZone(icu::UnicodeString::fromUTF8(zone_id)));
++      return;
++    }
++  }
++  // Tier 3: original platform-specific detection (no --fingerprint-config).
+ #if BUILDFLAG(IS_FUCHSIA)
+   // The platform-specific mechanisms used by ICU's detectHostTimeZone() to
+   // determine the default time zone will not work on Fuchsia. Therefore,
+diff --git a/components/embedder_support/BUILD.gn b/components/embedder_support/BUILD.gn
+index 847ba42327..f669d08478 100644
+--- a/components/embedder_support/BUILD.gn
++++ b/components/embedder_support/BUILD.gn
+@@ -58,6 +58,7 @@ static_library("user_agent") {
+   deps = [
+     ":embedder_support",
+     "//build:branding_buildflags",
++    "//components/moci:fingerprint_config",  # [MoCi fp-14 B] read navigator.platform from JSON
+     "//components/policy/core/common",
+     "//components/prefs",
+     "//components/version_info",
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 557eadb182..c355d1d933 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -10,11 +10,16 @@
+ #include <cstddef>
+ #include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/android/device_info.h"
+ #include "base/command_line.h"
++#include "base/values.h"
++#include "base/files/file_path.h"
++#include <functional>
+ #include "base/compiler_specific.h"
++#include "components/moci/fingerprint_config.h"
+ #include "base/feature_list.h"
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+@@ -177,12 +182,91 @@
+                                   additional_brand_version);
+ }
+ 
++// MoCi 2026-06-11: 从 fingerprint config 的 navigator.userAgent 提取声称的
++// Chrome 版本（{major, full}）。默认 userAgentData.brands 用 chromium 真实 major
++// （如 148），跟 spoof 的 UA 字符串（Chrome/120）不一致 → 检测脚本一对比即识破。
++// 取不到（无 config / 无 userAgent / 无 "Chrome/"）返回空 pair。
++std::pair<std::string, std::string> MoCiConfigChromeVersion() {
++  auto* cmd = base::CommandLine::ForCurrentProcess();
++  if (!cmd || !cmd->HasSwitch("fingerprint-config")) {
++    return {std::string(), std::string()};
++  }
++  const auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++  const auto* nav = dict.FindDict("navigator");
++  if (!nav) {
++    return {std::string(), std::string()};
++  }
++  const std::string* ua = nav->FindString("userAgent");
++  if (!ua) {
++    return {std::string(), std::string()};
++  }
++  size_t pos = ua->find("Chrome/");
++  if (pos == std::string::npos) {
++    return {std::string(), std::string()};
++  }
++  std::string ver = ua->substr(pos + 7);  // 7 = strlen("Chrome/")
++  size_t sp = ver.find(' ');
++  if (sp != std::string::npos) {
++    ver = ver.substr(0, sp);  // "120.0.0.0"
++  }
++  size_t dot = ver.find('.');
++  std::string major = (dot != std::string::npos) ? ver.substr(0, dot) : ver;
++  return {major, ver};
++}
++
++// MoCi 2026-06-11 (B1): 高熵 uaFullVersion / fullVersionList 必须是"真实 build"
++// （如 120.0.6099.216），不能是 reduced 的 "120.0.0.0"，更不能为空。真 Chrome 的
++// getHighEntropyValues 永远返完整 build（UA 才是 X.0.0.0）；返空 = headless/伪造特征，
++// 返 X.0.0.0 = 跟真机不符也是破绽。按 config 的 Chrome major 映射一个真实 stable build；
++// 未知 major 退回 config 的 full（至少 major 一致）。
++std::string MoCiFullChromeVersion() {
++  std::pair<std::string, std::string> v = MoCiConfigChromeVersion();
++  if (v.first.empty()) {
++    return std::string();
++  }
++  static const struct { const char* major; const char* full; } kBuilds[] = {
++      {"115", "115.0.5790.171"}, {"116", "116.0.5845.188"},
++      {"117", "117.0.5938.150"}, {"118", "118.0.5993.118"},
++      {"119", "119.0.6045.200"}, {"120", "120.0.6099.216"},
++      {"121", "121.0.6167.185"}, {"122", "122.0.6261.129"},
++      {"123", "123.0.6312.123"}, {"124", "124.0.6367.119"},
++      {"125", "125.0.6422.142"}, {"126", "126.0.6478.127"},
++      {"127", "127.0.6533.100"}, {"128", "128.0.6613.120"},
++  };
++  for (const auto& b : kBuilds) {
++    if (v.first == b.major) {
++      return std::string(b.full);
++    }
++  }
++  // [MoCi] 表里没有该 major：若 spoof 的 major 恰是内核真实 major（如 148），用内核
++  // 真实 4 段版本号（148.0.7778.x）——v.second 是 reduced 的 "X.0.0.0"，放进
++  // getHighEntropyValues 的 fullVersionList 是破绽（真 Chrome 此处永远是完整 build）。
++  // 用内核自己的真实版本不会过期、不会猜错、major 必一致。major 不匹配则保留
++  // v.second（至少 major 对）。
++  if (v.first == version_info::GetMajorVersionNumber()) {
++    return std::string(version_info::GetVersionNumber());
++  }
++  return v.second;  // 未知 major 退回 config full（major 仍对）
++}
++
+ // Return UserAgentBrandList with the major version populated in the brand
+ // `version` value.
+ // TODO(crbug.com/1291612): Consolidate *MajorVersionList() methods by using
+ // GetVersionNumber()
+ const blink::UserAgentBrandList GetUserAgentBrandMajorVersionListInternal(
+     std::optional<blink::UserAgentBrandVersion> additional_brand_version) {
++  // MoCi: brands 对齐 spoofed UA 版本 + 补 "Google Chrome" 品牌（CHROMIUM_BRANDING
++  // 默认 brand=nullopt 只产 [GREASE, Chromium]，缺 Google Chrome，跟"自称 Chrome"矛盾）。
++  // 传 seed=120 让 GREASE 也是 Chrome-120 一致的派生。
++  std::pair<std::string, std::string> moci_ver = MoCiConfigChromeVersion();
++  if (!moci_ver.first.empty()) {
++    int moci_major = 0;
++    if (base::StringToInt(moci_ver.first, &moci_major)) {
++      return GenerateBrandVersionList(
++          moci_major, std::optional<std::string>("Google Chrome"), moci_ver.first,
++          blink::UserAgentBrandVersionType::kMajorVersion, additional_brand_version);
++    }
++  }
+   return GetUserAgentBrandList(version_info::GetMajorVersionNumber(),
+                                std::string(version_info::GetVersionNumber()),
+                                blink::UserAgentBrandVersionType::kMajorVersion,
+@@ -207,6 +291,21 @@
+ // GetVersionNumber()
+ const blink::UserAgentBrandList GetUserAgentBrandFullVersionListInternal(
+     std::optional<blink::UserAgentBrandVersion> additional_brand_version) {
++  // MoCi: 同 Major 变体 —— brands 用 spoofed UA 版本 + Google Chrome 品牌。
++  // B1: fullVersionList 的版本用真实 build（120.0.6099.216）而非 reduced 的 120.0.0.0。
++  std::pair<std::string, std::string> moci_ver = MoCiConfigChromeVersion();
++  if (!moci_ver.first.empty()) {
++    int moci_major = 0;
++    if (base::StringToInt(moci_ver.first, &moci_major)) {
++      std::string moci_full = MoCiFullChromeVersion();
++      if (moci_full.empty()) {
++        moci_full = moci_ver.second;
++      }
++      return GenerateBrandVersionList(
++          moci_major, std::optional<std::string>("Google Chrome"), moci_full,
++          blink::UserAgentBrandVersionType::kFullVersion, additional_brand_version);
++    }
++  }
+   return GetUserAgentBrandList(version_info::GetMajorVersionNumber(),
+                                std::string(version_info::GetVersionNumber()),
+                                blink::UserAgentBrandVersionType::kFullVersion,
+@@ -640,6 +739,18 @@
+ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+   if (base::FeatureList::IsEnabled(blink::features::kReducedSystemInfo))
+     only_low_entropy_ch = true;
++  // [MoCi B1] 受管会话(有 fingerprint-config)必须像真 Chrome 一样提供高熵 CH
++  //   （architecture/bitness/platformVersion/uaFullVersion/fullVersionList）。
++  //   kReducedSystemInfo 会把 only_low_entropy_ch 强制成 true → 下面提前 return → 高熵字段全空
++  //   → getHighEntropyValues 返空 = 一眼 headless/伪造。这里有 config 时强制关掉低熵限制。
++  bool moci_has_config = false;
++  {
++    auto* moci_cmd = base::CommandLine::ForCurrentProcess();
++    if (moci_cmd && moci_cmd->HasSwitch("fingerprint-config")) {
++      only_low_entropy_ch = false;
++      moci_has_config = true;
++    }
++  }
+   blink::UserAgentMetadata metadata;
+ 
+   // Low entropy client hints.
+@@ -655,7 +766,10 @@
+   // Notes: Sending low entropy hints with empty values may cause requests being
+   // blocked by web application firewall software, etc.
+   std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
+-  if (custom_ua.has_value()) {
++  // [MoCi B1] MoCi 用 --user-agent 传 spoof UA + --fingerprint-config。原版在此早退只返
++  //   低熵 brands → 高熵(architecture/bitness/platformVersion/uaFullVersion/fullVersionList)
++  //   全空 = getHighEntropyValues 返空、一眼伪造。有 config 时不早退，继续往下填高熵。
++  if (custom_ua.has_value() && !moci_has_config) {
+     return base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)
+                ? blink::UserAgentMetadata()
+                : metadata;
+@@ -668,13 +782,107 @@
+   // High entropy client hints.
+   metadata.brand_full_version_list =
+       GetUserAgentBrandFullVersionListInternal(std::nullopt);
+-  metadata.full_version = std::string(version_info::GetVersionNumber());
++  // [MoCi B1] uaFullVersion 用 spoofed Chrome 的真实 build，不用宿主真实 chromium 版本(148)
++  {
++    std::string moci_full = MoCiFullChromeVersion();
++    metadata.full_version = moci_full.empty()
++                                ? std::string(version_info::GetVersionNumber())
++                                : moci_full;
++  }
+   metadata.architecture = GetCpuArchitecture();
+   metadata.model = BuildModelInfo();
+   metadata.form_factors = GetFormFactorsClientHint(metadata, metadata.mobile);
+   metadata.bitness = GetCpuBitness();
+   metadata.wow64 = IsWoW64();
+   metadata.platform_version = GetPlatformVersion();
++
++  // [MoCi fp-14 B] read Sec-CH-UA-Platform / Platform-Version / Architecture
++  // from JSON clientHints.* (preferred) or navigator.platform mapping.
++  // Fallback: pool by path-hash.
++  bool applied = false;
++  {
++    auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++    if (auto* ch = dict.FindDict("clientHints")) {
++      if (const std::string* v = ch->FindString("platform")) {
++        metadata.platform = *v;
++        applied = true;
++      }
++      if (const std::string* v = ch->FindString("platformVersion")) {
++        metadata.platform_version = *v;
++        applied = true;
++      }
++      if (const std::string* v = ch->FindString("architecture")) {
++        metadata.architecture = *v;
++      }
++      if (auto mobile = ch->FindBool("mobile")) {
++        metadata.mobile = *mobile;
++      } else {
++        metadata.mobile = false;
++      }
++      if (const std::string* v = ch->FindString("bitness")) {
++        metadata.bitness = *v;
++      } else {
++        metadata.bitness = "64";
++      }
++      metadata.wow64 = false;
++      metadata.model = "";
++    }
++    // Also accept simpler navigator.platform mapping if clientHints absent.
++    if (!applied) {
++      if (auto* nav = dict.FindDict("navigator")) {
++        if (const std::string* plat = nav->FindString("platform")) {
++          // Map navigator.platform string -> Sec-CH-UA-Platform.
++          if (plat->find("Win") != std::string::npos) metadata.platform = "Windows";
++          else if (plat->find("Mac") != std::string::npos) metadata.platform = "macOS";
++          else if (plat->find("Linux") != std::string::npos) metadata.platform = "Linux";
++          else metadata.platform = *plat;
++          applied = true;
++          metadata.mobile = false;
++          metadata.bitness = "64";
++          metadata.wow64 = false;
++          metadata.model = "";
++          // [MoCi B1] 补 architecture + platformVersion，别留宿主真实值/空
++          metadata.architecture = "x86";
++          if (metadata.platform == "Windows") {
++            metadata.platform_version = "15.0.0";  // Windows 11
++          } else if (metadata.platform == "macOS") {
++            metadata.platform_version = "14.5.0";
++          } else {
++            metadata.platform_version = "";  // Linux 桌面 CH 习惯空
++          }
++        }
++      }
++    }
++  }
++  if (!applied) {
++    if (auto* cmd = base::CommandLine::ForCurrentProcess();
++        cmd && cmd->HasSwitch("fingerprint-config")) {
++      auto p = cmd->GetSwitchValuePath("fingerprint-config");
++      if (!p.empty()) {
++        struct PlatPool { const char* platform; const char* version; const char* architecture; };
++        static const PlatPool kPool[] = {
++          {"Windows", "10.0.0",  "x86"},
++          {"Windows", "15.0.0",  "x86"},  // Windows 11
++          {"Windows", "15.0.0",  "x86"},
++          {"macOS",   "14.3.0",  "arm"},
++          {"macOS",   "13.5.0",  "x86"},
++          {"Linux",   "",        "x86"},
++          {"Windows", "10.0.0",  "x86"},
++          {"Windows", "15.0.0",  "x86"},
++        };
++        auto seed = std::hash<base::FilePath::StringType>{}(p.value());
++        const auto& pick = kPool[seed % std::size(kPool)];
++        metadata.platform = pick.platform;
++        metadata.platform_version = pick.version;
++        metadata.architecture = pick.architecture;
++        metadata.mobile = false;
++        metadata.wow64 = false;
++        metadata.bitness = "64";
++        metadata.model = "";  // empty per HTTPWG recommendation for desktop
++      }
++    }
++  }
++
+   return metadata;
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/netinfo/network_information.cc b/third_party/blink/renderer/modules/netinfo/network_information.cc
+index 976a3c8c36..a4681d0e1e 100644
+--- a/third_party/blink/renderer/modules/netinfo/network_information.cc
++++ b/third_party/blink/renderer/modules/netinfo/network_information.cc
+@@ -6,7 +6,12 @@
+ 
+ #include <algorithm>
+ 
++#include "base/command_line.h"
++#include "base/files/file_path.h"
+ #include "base/time/time.h"
++#include "components/moci/fingerprint_config.h"
++
++#include <functional>
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_connection_type.h"
+@@ -110,7 +115,46 @@ double NetworkInformation::downlinkMax() const {
+   return downlink_max_mbps_;
+ }
+ 
++namespace {
++
++// MoCi fp-22: per-env spoof of NetworkInformation (effectiveType / rtt / downlink)
++// pulled from --fingerprint-config path hash so each environment looks like
++// a different network connection.
++bool MoCiNetSpoof(uint64_t* out_seed) {
++  auto* cmd = base::CommandLine::ForCurrentProcess();
++  if (!cmd || !cmd->HasSwitch("fingerprint-config")) return false;
++  auto p = cmd->GetSwitchValuePath("fingerprint-config");
++  if (p.empty()) return false;
++  *out_seed = static_cast<uint64_t>(
++      std::hash<base::FilePath::StringType>{}(p.value()));
++  return true;
++}
++
++}  // namespace
++
+ V8EffectiveConnectionType NetworkInformation::effectiveType() {
++  // [MoCi fp-22 B] connection.effectiveType from JSON (string: "4g"/"3g"/"2g"/"slow-2g").
++  {
++    auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++    if (auto* conn = dict.FindDict("connection")) {
++      if (const std::string* et = conn->FindString("effectiveType")) {
++        if (*et == "4g") return V8EffectiveConnectionType(V8EffectiveConnectionType::Enum::k4G);
++        if (*et == "3g") return V8EffectiveConnectionType(V8EffectiveConnectionType::Enum::k3G);
++        if (*et == "2g") return V8EffectiveConnectionType(V8EffectiveConnectionType::Enum::k2G);
++        if (*et == "slow-2g") return V8EffectiveConnectionType(V8EffectiveConnectionType::Enum::kSlow2G);
++      }
++    }
++  }
++  uint64_t s;
++  if (MoCiNetSpoof(&s)) {
++    static const V8EffectiveConnectionType::Enum kPool[] = {
++      V8EffectiveConnectionType::Enum::k4G,
++      V8EffectiveConnectionType::Enum::k4G,
++      V8EffectiveConnectionType::Enum::k3G,
++      V8EffectiveConnectionType::Enum::k4G,
++    };
++    return V8EffectiveConnectionType(kPool[s % std::size(kPool)]);
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<WebEffectiveConnectionType> override_ect =
+       GetNetworkStateNotifier().GetWebHoldbackEffectiveType();
+@@ -132,6 +176,18 @@ V8EffectiveConnectionType NetworkInformation::effectiveType() {
+ }
+ 
+ uint32_t NetworkInformation::rtt() {
++  // [MoCi fp-22 B] connection.rtt from JSON (ms).
++  {
++    auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++    if (auto* conn = dict.FindDict("connection")) {
++      if (auto v = conn->FindInt("rtt")) return static_cast<uint32_t>(*v);
++    }
++  }
++  uint64_t s;
++  if (MoCiNetSpoof(&s)) {
++    // Round to 25ms per spec (https://wicg.github.io/netinfo/#round-the-round-trip-time)
++    return static_cast<uint32_t>(50 + (s % 6) * 25);  // 50-175ms
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<base::TimeDelta> override_rtt =
+       GetNetworkStateNotifier().GetWebHoldbackHttpRtt();
+@@ -148,6 +204,19 @@ uint32_t NetworkInformation::rtt() {
+ }
+ 
+ double NetworkInformation::downlink() {
++  // [MoCi fp-22 B] connection.downlink from JSON (Mbps).
++  {
++    auto& dict = moci::MoCiFingerprintConfig::Get().GetDict();
++    if (auto* conn = dict.FindDict("connection")) {
++      if (auto v = conn->FindDouble("downlink")) return *v;
++      if (auto v = conn->FindInt("downlink")) return static_cast<double>(*v);
++    }
++  }
++  uint64_t s;
++  if (MoCiNetSpoof(&s)) {
++    // Multiples of 0.05 Mbps per spec
++    return 1.0 + ((s >> 8) % 200) * 0.05;  // 1.0-11.0 Mbps
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<double> override_downlink_mbps =
+       GetNetworkStateNotifier().GetWebHoldbackDownlinkThroughputMbps();

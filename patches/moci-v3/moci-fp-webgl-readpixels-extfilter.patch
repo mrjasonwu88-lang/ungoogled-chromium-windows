@@ -1,0 +1,105 @@
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -37,6 +37,7 @@
+ #include "base/files/file_path.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "components/moci/fingerprint_config.h"
++#include "components/moci/fingerprint_helpers.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/notimplemented.h"
+@@ -157,6 +158,7 @@
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_utf8_adaptor.h"
+ #include "third_party/skia/include/core/SkImage.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+ // Populates parameters from texImage2D except for border, width, height, and
+@@ -4392,6 +4394,26 @@
+     }
+   }
+ 
++  // [MoCi v.217] 按 config.webgl.disabledExtensions 剔除跟伪装 renderer 不一致的
++  //   宿主 GPU/驱动专属扩展。未配置/空列表 → 不过滤（ANGLE 自然列表本就归一化）。
++  std::vector<std::string> moci_disabled = moci::GetWebGLDisabledExtensions();
++  if (!moci_disabled.empty()) {
++    Vector<String> filtered;
++    for (const String& ext : result) {
++      std::string ext_utf8 = ext.Utf8();
++      bool drop = false;
++      for (const std::string& d : moci_disabled) {
++        if (ext_utf8 == d) {
++          drop = true;
++          break;
++        }
++      }
++      if (!drop)
++        filtered.push_back(ext);
++    }
++    result = std::move(filtered);
++  }
++
+   return result;
+ }
+ 
+@@ -5215,6 +5237,19 @@
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
+   }
++
++  // [MoCi v.217] readPixels 是 2D canvas 噪声的真旁路：直读 GPU 像素可绕过
++  //   getImageData hook。对 RGBA8 结果套用与 2D canvas 同款 per-env 噪声
++  //   (ShuffleSubchannelColorData 内部按 --fingerprint-config 派生确定性种子)，
++  //   让 WebGL canvas hash 跨 env 不同。本类是 HTMLCanvas + OffscreenCanvas
++  //   两条 WebGL 路径的共同基类，故一处覆盖两者。
++  if (data && width >= 8 && height >= 8 && format == GL_RGBA &&
++      type == GL_UNSIGNED_BYTE &&
++      RuntimeEnabledFeatures::FingerprintingCanvasImageDataNoiseEnabled()) {
++    SkImageInfo moci_info = SkImageInfo::Make(
++        width, height, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
++    StaticBitmapImage::ShuffleSubchannelColorData(data, moci_info, 0, 0);
++  }
+ }
+ 
+ void WebGLRenderingContextBase::RenderbufferStorageImpl(
+--- a/components/moci/fingerprint_helpers.h
++++ b/components/moci/fingerprint_helpers.h
+@@ -170,6 +170,15 @@
+ // case-insensitive lookup；未 ShouldFilterFonts 时返 true（不过滤）
+ COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG) bool IsFontAllowed(const std::string& font_family);
+ 
++// ============================================================
++// v.217 WebGL extension list filter
++// ============================================================
++// config.webgl.disabledExtensions = ["EXT_xxx", ...] → 从 getSupportedExtensions()
++// 返回列表里剔除这些扩展（隐藏跟伪装 renderer 不一致的宿主 GPU/驱动专属扩展）。
++// 未配置 / 空列表 → 不过滤（保留 ANGLE 自然列表，本就跨 GPU 归一化）。
++COMPONENT_EXPORT(MOCI_FINGERPRINT_CONFIG)
++std::vector<std::string> GetWebGLDisabledExtensions();
++
+ }  // namespace moci
+ 
+ #endif  // COMPONENTS_MOCI_FINGERPRINT_HELPERS_H_
+--- a/components/moci/fingerprint_helpers.cc
++++ b/components/moci/fingerprint_helpers.cc
+@@ -86,6 +86,19 @@
+   const auto* d = TopDict("webgpu");
+   if (!d) return result;
+   const auto* list = d->FindList("features");
++  if (!list) return result;
++  for (const auto& v : *list) {
++    if (v.is_string()) result.push_back(v.GetString());
++  }
++  return result;
++}
++
++// v.217 WebGL extension list filter（config.webgl.disabledExtensions）
++std::vector<std::string> GetWebGLDisabledExtensions() {
++  std::vector<std::string> result;
++  const auto* d = TopDict("webgl");
++  if (!d) return result;
++  const auto* list = d->FindList("disabledExtensions");
+   if (!list) return result;
+   for (const auto& v : *list) {
+     if (v.is_string()) result.push_back(v.GetString());

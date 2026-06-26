@@ -48,3 +48,4 @@ moci-v3/moci-suppress-settings-bubble.patch
 moci-v3/moci-newtab-redirect.patch
 moci-v3/moci-newtab-blank-omnibox.patch
 moci-v3/moci-toolbar-webstore-button.patch
+moci-v3/moci-fp-webgl-readpixels-extfilter.patch
